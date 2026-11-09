@@ -1,186 +1,429 @@
-"""rubicon: reversibility-aware execution for AI agent plans.
+"""Rubicon: reversibility-aware execution for AI agent plans and tool calls.
 
-Every tool declares whether it can be undone. Given a plan (e.g. written by an LLM),
-rubicon:
-  1. reorders it so undoable steps run first and permanent ones run last (respecting dependencies),
-  2. runs every permanent step's `check` (dry-run) BEFORE the point of no return,
-  3. asks `confirm` once for the whole commit phase,
-  4. on any failure, undoes completed undoable steps in reverse order.
+Every tool declares once whether it can be undone. Rubicon then guarantees:
+  * undoable steps run first and permanent steps last (dependencies respected),
+  * every permanent step is dry-run (`check`) before the point of no return,
+  * one confirmation covers all permanent steps,
+  * any failure, refusal or interruption before commit undoes completed steps in reverse order.
 
-Plan format (JSON-friendly, so a model can emit it):
-  [{"id": "hold", "tool": "book_flight", "args": {"flight": "AI101"}},
-   {"id": "cancel", "tool": "cancel_booking", "args": {"ref": "OLD1"}, "after": ["hold"]}]
-An arg value "$<id>" is replaced by that step's result and adds an implicit dependency.
+Two ways to use it:
+  run(plan) / await arun(plan)   execute a whole plan, e.g. one written by an LLM
+  Transaction()                  guard any agent loop: undoable calls run immediately, permanent
+                                 calls are dry-run immediately and deferred until commit()
+
+Tools, undo, check and confirm functions may be sync or async.
+
+Plan format (JSON-friendly, so a model can write it):
+  [{"id": "hold", "tool": "hold_seat", "args": {"flight": "AI101"}},
+   {"id": "mail", "tool": "send_email", "args": {"body": "Held: $hold"}, "after": ["hold"]}]
+"$<id>" as a whole argument value passes that step's raw result; inside text it inserts it as
+text. References work in nested lists/objects and add a dependency automatically.
 """
+import asyncio
+import concurrent.futures
+import functools
 import inspect
+import itertools
 import re
+import typing
 from dataclasses import dataclass
-from graphlib import TopologicalSorter
+from graphlib import CycleError, TopologicalSorter
 from typing import Callable
 
-NOOP = lambda result: None  # undo for read-only tools
+
+def NOOP(result):
+    """Undo for read-only tools: there is nothing to reverse."""
 
 
 @dataclass
 class Tool:
     fn: Callable
-    undo: Callable | None  # None = permanent
-    check: Callable | None  # dry-run for permanent tools; raise to block
+    undo: Callable | None = None  # undo(result); None means the tool is permanent
+    check: Callable | None = None  # check(**args): dry run for permanent tools; raise to block
 
     @property
-    def reversible(self):
+    def reversible(self) -> bool:
         return self.undo is not None
 
 
-TOOLS: dict[str, Tool] = {}
+TOOLS: dict[str, Tool] = {}  # default registry; pass registry={} anywhere for an isolated one
 
 
-def tool(undo=None, check=None):
-    """Register a tool. undo(result) reverses it; leave undo=None for permanent actions."""
-    def wrap(fn):
-        TOOLS[fn.__name__] = Tool(fn, undo, check)
-        return fn
-    return wrap
+def tool(fn=None, *, undo=None, check=None, name=None, registry=None):
+    """Register a tool.
+
+    @tool                      permanent
+    @tool(check=validate)      permanent, dry-run before the point of no return
+    @tool(undo=reverse)        undoable; reverse(result) is called on rollback
+    @tool(undo=NOOP)           read-only
+    """
+    def register(f):
+        (TOOLS if registry is None else registry)[name or f.__name__] = Tool(f, undo, check)
+        return f
+    return register(fn) if fn is not None else register
 
 
-def tools_for_llm():
-    """Tool list with reversibility visible to the model (most frameworks hide this)."""
-    return [{"name": n, "doc": (t.fn.__doc__ or "").strip(), "reversible": t.reversible,
-             "args": getattr(t.fn, "input_schema", None) or str(inspect.signature(t.fn))}
-            for n, t in TOOLS.items()]
+_JSON_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean",
+               list: "array", tuple: "array", dict: "object"}
+
+
+def _schema(fn):
+    """JSON Schema for a tool's arguments: explicit `fn.input_schema`, else from the signature."""
+    explicit = getattr(fn, "input_schema", None)
+    if explicit:
+        return explicit
+    try:
+        hints = typing.get_type_hints(fn)
+    except Exception:
+        hints = {}
+    props, required = {}, []
+    for p in inspect.signature(fn).parameters.values():
+        if p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
+            continue
+        h = hints.get(p.name)
+        t = _JSON_TYPES.get(typing.get_origin(h) or h)
+        props[p.name] = {"type": t} if t else {}
+        if p.default is p.empty:
+            required.append(p.name)
+    return {"type": "object", "properties": props, "required": required}
+
+
+def tools_for_llm(registry=None):
+    """Registered tools with description, JSON Schema parameters and reversibility."""
+    reg = TOOLS if registry is None else registry
+    return [{"name": n, "description": inspect.getdoc(t.fn) or "", "reversible": t.reversible,
+             "parameters": _schema(t.fn)} for n, t in reg.items()]
 
 
 class PlanFailed(Exception):
-    def __init__(self, step, cause, undone, committed):
+    """A step failed, a check blocked, or the commit was declined. `undone` steps were reversed."""
+
+    def __init__(self, step, cause, undone, committed, undo_failed, results):
         self.step, self.cause, self.undone, self.committed = step, cause, undone, committed
-        super().__init__(f"step {step!r} failed: {cause!r}; undone={undone}; "
-                         f"already committed (cannot undo)={committed}")
+        self.undo_failed, self.results = undo_failed, results
+        msg = f"step {step!r} failed: {cause!r}; undone={undone}; committed (cannot undo)={committed}"
+        if undo_failed:
+            msg += f"; UNDO FAILED for {undo_failed}"
+        super().__init__(msg)
 
 
+_ID = re.compile(r"[\w-]+")
 _REF = re.compile(r"\$([\w-]+)")
 
 
+def _walk(v, f):
+    if isinstance(v, str):
+        return f(v)
+    if isinstance(v, dict):
+        return {k: _walk(x, f) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_walk(x, f) for x in v]
+    return v
+
+
 def _refs(args, ids):
-    """Step ids referenced as "$id" anywhere in string args ("$50" etc. are not refs)."""
-    return [m for v in args.values() if isinstance(v, str) for m in _REF.findall(v) if m in ids]
+    """Step ids referenced as "$id" anywhere in args ("$50" etc. are not references)."""
+    found = []
+    _walk(args, lambda s: found.extend(m for m in _REF.findall(s) if m in ids) or s)
+    return found
 
 
 def _resolve(args, results):
-    """Whole-value "$id" -> the raw result; "$id" inside text -> str(result)."""
-    def sub(v):
-        if not isinstance(v, str):
-            return v
-        m = _REF.fullmatch(v)
+    def sub(s):
+        m = _REF.fullmatch(s)
         if m and m[1] in results:
             return results[m[1]]
-        return _REF.sub(lambda m: str(results[m[1]]) if m[1] in results else m[0], v)
-    return {k: sub(v) for k, v in args.items()}
+        return _REF.sub(lambda m: str(results[m[1]]) if m[1] in results else m[0], s)
+    return _walk(args, sub)
 
 
-def order(plan):
-    """Topological order; among ready steps, undoable first, then original plan order."""
-    by_id = {s["id"]: s for s in plan}
-    unknown = [s["tool"] for s in plan if s["tool"] not in TOOLS]
-    if unknown:
-        raise ValueError(f"unknown tools: {unknown}")
-    if len(by_id) != len(plan):
-        raise ValueError("duplicate step ids")
-    deps = {s["id"]: [*s.get("after", []), *_refs(s.get("args", {}), by_id)] for s in plan}
-    dangling = {d for ds in deps.values() for d in ds} - by_id.keys()
+async def _call(fn, *args, **kwargs):
+    r = fn(*args, **kwargs)
+    return await r if inspect.isawaitable(r) else r
+
+
+def _sync(coro, thread_ok=False):
+    """Run a coroutine from sync code."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    if thread_ok:  # sync caller on an event-loop thread; the work has no loop affinity
+        with concurrent.futures.ThreadPoolExecutor(1) as ex:
+            return ex.submit(asyncio.run, coro).result()
+    coro.close()
+    raise RuntimeError("called from inside a running event loop; use the async API "
+                       "(await arun(...), await tx.acall(...), async with Transaction())")
+
+
+def order(plan, registry=None):
+    """Validate a plan and return its execution order: undoable steps first, then plan order."""
+    tools = TOOLS if registry is None else registry
+    if not isinstance(plan, list):
+        raise ValueError("plan must be a list of steps")
+    by_id = {}
+    for s in plan:
+        if not isinstance(s, dict):
+            raise ValueError(f"step is not an object: {s!r}")
+        sid, name, after = s.get("id"), s.get("tool"), s.get("after", [])
+        if not isinstance(sid, str) or not _ID.fullmatch(sid):
+            raise ValueError(f"invalid step id {sid!r} (use letters, digits, _ or -)")
+        if sid in by_id:
+            raise ValueError(f"duplicate step id {sid!r}")
+        if not isinstance(name, str) or name not in tools:
+            raise ValueError(f"step {sid!r}: unknown tool {name!r}")
+        if not isinstance(s.get("args", {}), dict):
+            raise ValueError(f"step {sid!r}: args must be an object")
+        if not isinstance(after, list) or not all(isinstance(a, str) for a in after):
+            raise ValueError(f"step {sid!r}: after must be a list of step ids")
+        by_id[sid] = s
+    deps = {sid: [*s.get("after", []), *_refs(s.get("args", {}), by_id)] for sid, s in by_id.items()}
+    dangling = sorted({d for ds in deps.values() for d in ds} - by_id.keys())
     if dangling:
-        raise ValueError(f"steps depend on unknown ids: {sorted(dangling)}")
-    pos = {s["id"]: i for i, s in enumerate(plan)}
+        raise ValueError(f"steps depend on unknown ids: {dangling}")
+    pos = {sid: i for i, sid in enumerate(by_id)}
     ts = TopologicalSorter(deps)
-    ts.prepare()  # raises CycleError on cycles
+    try:
+        ts.prepare()
+    except CycleError as e:
+        raise ValueError(f"plan has a dependency cycle: {e.args[1]}") from e
     out, ready = [], []
     while ts.is_active():
         ready += ts.get_ready()
-        ready.sort(key=lambda i: (not TOOLS[by_id[i]["tool"]].reversible, pos[i]))
+        ready.sort(key=lambda i: (not tools[by_id[i]["tool"]].reversible, pos[i]))
         i = ready.pop(0)
         out.append(by_id[i])
         ts.done(i)
     return out
 
 
-def run(plan, confirm=lambda steps: True, log=print):
-    steps = order(plan)
-    ids = {s["id"] for s in steps}
-    rev = lambda s: TOOLS[s["tool"]].reversible
-    # point of no return = first permanent step; everything before it is fully undoable
-    ponr = next((i for i, s in enumerate(steps) if not rev(s)), len(steps))
-    results, done, committed = {}, [], []
+def _approve(steps):
+    return True
 
-    def fail(step, cause):
-        undone = []
-        for s in reversed(done):
+
+class Transaction:
+    """Guard tool calls from any agent loop.
+
+    Undoable tools run immediately. Permanent tools are dry-run immediately (so the agent sees a
+    check failure and can react) and deferred: the agent gets a "scheduled" message, and they run
+    on commit() after one confirmation. Any exception inside the `with` block, a declined
+    confirmation, or a failing permanent step rolls back every undoable call in reverse order.
+
+        with Transaction(confirm=ask_human) as tx:        # or: async with
+            tools = tx.wrap_all()                         # hand these to your agent framework
+            ...                                           # commit on clean exit, rollback on error
+    """
+
+    def __init__(self, registry=None, confirm=None, log=print):
+        self.tools = TOOLS if registry is None else registry
+        self.confirm, self.log = confirm or _approve, log
+        self.done = []  # (label, tool, result) of undoable calls, in execution order
+        self.pending = []  # permanent steps waiting for commit
+        self.committed, self.results = [], {}
+        self._ids = itertools.count(1)
+
+    def _tool(self, name):
+        if name not in self.tools:
+            raise ValueError(f"unknown tool {name!r}")
+        return self.tools[name]
+
+    async def _run_undoable(self, label, name, args):
+        r = await _call(self._tool(name).fn, **args)
+        self.done.append((label, name, r))
+        self.results[label] = r
+        self.log(f"ran {label}")
+        return r
+
+    async def _run_permanent(self, label, name, args):
+        r = await _call(self._tool(name).fn, **args)
+        self.committed.append(label)
+        self.results[label] = r
+        self.log(f"COMMITTED {label}")
+        return r
+
+    async def acall(self, name, /, **args):
+        t = self._tool(name)
+        label = f"{name}-{next(self._ids)}"
+        if t.reversible:
+            return await self._run_undoable(label, name, args)
+        if t.check:
+            await _call(t.check, **args)
+        self.pending.append({"id": label, "tool": name, "args": args})
+        return (f"Scheduled {name} ({label}): it is a permanent action and will run after "
+                f"confirmation when the transaction commits.")
+
+    async def arollback(self):
+        """Undo every undoable call in reverse order and drop pending permanent steps."""
+        undone, failed = [], []
+        while self.done:
+            label, name, r = self.done.pop()
             try:
-                TOOLS[s["tool"]].undo(results[s["id"]])
-                undone.append(s["id"])
+                await _call(self.tools[name].undo, r)
+                undone.append(label)
             except Exception as e:  # keep unwinding; report what stuck
-                log(f"undo of {s['id']} failed: {e!r}")
-        raise PlanFailed(step, cause, undone, committed) from cause
+                self.log(f"undo of {label} failed: {e!r}")
+                failed.append(label)
+        self.pending.clear()
+        return undone, failed
 
-    def call(s):
+    async def _fail(self, step, cause):
+        undone, failed = await self.arollback()
+        return PlanFailed(step, cause, undone, list(self.committed), failed, dict(self.results))
+
+    async def acommit(self):
+        """Confirm and run pending permanent steps. Returns all results."""
+        steps, current = list(self.pending), "confirm"
         try:
-            results[s["id"]] = TOOLS[s["tool"]].fn(**_resolve(s.get("args", {}), results))
+            if steps and not await _call(self.confirm, steps):
+                raise RuntimeError("commit not confirmed")
+            for s in steps:
+                current = s["id"]
+                await self._run_permanent(s["id"], s["tool"], s["args"])
         except Exception as e:
-            fail(s["id"], e)
-        (done if rev(s) else committed).append(s if rev(s) else s["id"])
-        log(f"{'ran' if rev(s) else 'COMMITTED'} {s['id']}")
+            raise await self._fail(current, e) from e
+        except BaseException:
+            await self.arollback()
+            raise
+        self.pending.clear()
+        self.done.clear()  # committed: earlier undoable calls are now final
+        return dict(self.results)
 
-    for s in steps[:ponr]:
-        call(s)
+    def call(self, name, /, **args):
+        return _sync(self.acall(name, **args))
 
-    tail = steps[ponr:]
-    # gate: dry-run every permanent step whose inputs are known now
-    def check(s):
-        try:
-            TOOLS[s["tool"]].check(**_resolve(s.get("args", {}), results))
-        except Exception as e:
-            fail(s["id"], e)
+    def commit(self):
+        return _sync(self.acommit())
 
-    checked = set()
-    for s in tail:
-        if not rev(s) and TOOLS[s["tool"]].check and all(r in results for r in _refs(s.get("args", {}), ids)):
-            check(s)
-            checked.add(s["id"])
-    if tail and not confirm(tail):
-        fail("confirm", RuntimeError("commit phase not confirmed"))
+    def rollback(self):
+        return _sync(self.arollback())
 
-    for s in tail:
-        # NOTE: a permanent step that needs another permanent step's output can only be
-        # checked just-in-time, after the point of no return; split the plan if that matters.
-        if not rev(s) and TOOLS[s["tool"]].check and s["id"] not in checked:
-            check(s)
-        call(s)
-    return results
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            await self.acommit()
+        else:
+            await self.arollback()
+        return False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self.commit()
+        else:
+            self.rollback()
+        return False
+
+    def wrap(self, name):
+        """The tool as a guarded function with the original name, docstring and signature."""
+        fn = self._tool(name).fn
+        sig = inspect.signature(fn)
+
+        def kwargs(a, k):
+            return dict(sig.bind(*a, **k).arguments) if a else k
+
+        if inspect.iscoroutinefunction(fn):
+            @functools.wraps(fn)
+            async def guarded(*a, **k):
+                return await self.acall(name, **kwargs(a, k))
+        else:
+            @functools.wraps(fn)
+            def guarded(*a, **k):
+                return _sync(self.acall(name, **kwargs(a, k)), thread_ok=True)
+        return guarded
+
+    def wrap_all(self):
+        return [self.wrap(n) for n in self.tools]
+
+
+async def arun(plan, registry=None, confirm=None, log=print):
+    """Execute a plan safely. Returns {step_id: result}; raises PlanFailed after rolling back."""
+    steps = order(plan, registry)
+    tx = Transaction(registry, confirm, log)
+    tools, ids, results = tx.tools, {s["id"] for s in steps}, tx.results
+    perm = lambda s: not tools[s["tool"]].reversible
+    args = lambda s: _resolve(s.get("args", {}), results)
+    # point of no return = first permanent step; everything before it can be fully undone
+    ponr = next((i for i, s in enumerate(steps) if perm(s)), len(steps))
+    tail, checked, current = steps[ponr:], set(), None
+    try:
+        for s in steps[:ponr]:
+            current = s["id"]
+            await tx._run_undoable(current, s["tool"], args(s))
+        for s in tail:  # dry-run every permanent step whose inputs are already known
+            check = tools[s["tool"]].check
+            if perm(s) and check and all(r in results for r in _refs(s.get("args", {}), ids)):
+                current = s["id"]
+                await _call(check, **args(s))
+                checked.add(current)
+        permanent = [{**s, "args": args(s)} for s in tail if perm(s)]
+        current = "confirm"
+        if permanent and not await _call(tx.confirm, permanent):
+            raise RuntimeError("commit phase not confirmed")
+        for s in tail:
+            current, a = s["id"], args(s)
+            if perm(s):
+                # NOTE: a permanent step that needs another permanent step's output can only be
+                # checked here, after the point of no return; split the plan if that matters.
+                check = tools[s["tool"]].check
+                if check and current not in checked:
+                    await _call(check, **a)
+                await tx._run_permanent(current, s["tool"], a)
+            else:
+                await tx._run_undoable(current, s["tool"], a)
+    except Exception as e:
+        raise await tx._fail(current, e) from e
+    except BaseException:  # Ctrl+C, task cancellation: still unwind, then propagate
+        await tx.arollback()
+        raise
+    return dict(results)
+
+
+def run(plan, registry=None, confirm=None, log=print):
+    """Sync version of arun(). Inside an event loop, use `await arun(...)` instead."""
+    return _sync(arun(plan, registry, confirm, log))
 
 
 if __name__ == "__main__":
-    # Rebooking demo: the classic agent mistake is cancelling first, then finding no seats.
-    db = {"bookings": {"OLD1"}, "holds": set(), "seats": {"AI101": 1}, "outbox": []}
+    quiet = lambda m: None
+
+    def expect(exc, fn, *a, **k):
+        try:
+            fn(*a, **k)
+        except exc as e:
+            return e
+        raise AssertionError(f"expected {exc.__name__}")
+
+    # --- rebooking scenario: the classic agent mistake is cancelling first ---
+    db = {"bookings": {"OLD1"}, "holds": [], "seats": {"AI101": 1}, "outbox": []}
 
     @tool(undo=NOOP)
-    def search(route):
-        """Find flights."""
+    def search(route: str) -> list:
+        """Find flights with free seats."""
         return [f for f, n in db["seats"].items() if n > 0]
 
-    @tool(undo=lambda hold: (db["holds"].discard(hold), db["seats"].__setitem__(hold[1], db["seats"][hold[1]] + 1)))
-    def book_flight(flight):
+    def release(hold):
+        db["holds"].remove(hold["flight"])
+        db["seats"][hold["flight"]] += 1
+
+    @tool(undo=release)
+    def book_flight(flight: str, note: str = "") -> dict:
         """Hold a seat (can be released)."""
         if db["seats"].get(flight, 0) < 1:
             raise RuntimeError(f"no seats on {flight}")
         db["seats"][flight] -= 1
-        hold = ("H", flight)
-        db["holds"].add(hold)
-        return hold
+        db["holds"].append(flight)
+        return {"flight": flight}
 
     def must_exist(ref):
         if ref not in db["bookings"]:
             raise RuntimeError(f"no booking {ref}")
 
     @tool(check=must_exist)
-    def cancel_booking(ref):
+    def cancel_booking(ref: str):
         """Cancel a booking. PERMANENT."""
         db["bookings"].remove(ref)
 
@@ -189,52 +432,147 @@ if __name__ == "__main__":
             raise RuntimeError(f"bad address {to}")
 
     @tool(check=valid_to)
-    def send_email(to, body):
+    def send_email(to: str, body: str):
         """Send an email. PERMANENT."""
         db["outbox"].append((to, body))
 
-    # The plan a naive model writes: cancel first.
     def plan(flight="AI101", to="me@x.com"):
         return [
             {"id": "cancel", "tool": "cancel_booking", "args": {"ref": "OLD1"}},
             {"id": "find", "tool": "search", "args": {"route": "BLR-DEL"}},
             {"id": "hold", "tool": "book_flight", "args": {"flight": flight}},
-            {"id": "mail", "tool": "send_email", "args": {"to": to, "body": "$hold"}},
+            {"id": "mail", "tool": "send_email", "args": {"to": to, "body": "held $hold"}},
         ]
 
+    def clean():
+        return db["bookings"] == {"OLD1"} and db["seats"]["AI101"] == 1 and not db["holds"]
+
     assert [s["id"] for s in order(plan())] == ["find", "hold", "cancel", "mail"]
-    # "$id" inside text is substituted and creates a dependency; "$50" is just text.
-    assert _resolve({"b": "held $hold for $50", "w": "$hold"}, {"hold": ("H", "AI101")}) == \
-        {"b": "held ('H', 'AI101') for $50", "w": ("H", "AI101")}
-    assert [s["id"] for s in order([{"id": "m", "tool": "send_email", "args": {"to": "a@b", "body": "ref $h, $50"}},
-                                    {"id": "h", "tool": "book_flight", "args": {"flight": "AI101"}}])] == ["h", "m"]
-    assert {t["name"]: t["reversible"] for t in tools_for_llm()}["cancel_booking"] is False
 
-    # 1. No seats: old booking must survive.
+    # references: inside text, nested, and "$50" left alone
+    assert _resolve({"b": "held $hold for $50", "w": "$hold", "n": [{"x": "$hold"}]},
+                    {"hold": {"f": 1}}) == {"b": "held {'f': 1} for $50", "w": {"f": 1}, "n": [{"x": {"f": 1}}]}
+    assert [s["id"] for s in order([
+        {"id": "m", "tool": "send_email", "args": {"to": "a@b", "body": ["ref", "$h", "$50"]}},
+        {"id": "h", "tool": "book_flight", "args": {"flight": "AI101"}}])] == ["h", "m"]
+
+    # malformed plans are rejected before anything runs
+    good = {"id": "a", "tool": "search", "args": {"route": "x"}}
+    for bad in ["nope", [1], [{**good, "id": "a b"}], [{**good, "id": 3}], [good, good],
+                [{**good, "tool": "nope"}], [{**good, "tool": ["x"]}], [{**good, "args": [1]}],
+                [{**good, "after": "b"}], [{**good, "after": ["ghost"]}], [{**good, "after": ["a"]}]]:
+        expect(ValueError, order, bad)
+
+    # 1. no seats -> old booking survives, nothing committed
+    e = expect(PlanFailed, run, plan(flight="XX9"), log=quiet)
+    assert e.step == "hold" and e.committed == [] and clean()
+
+    # 2. dry-run blocks -> seat released, nothing permanent happened
+    e = expect(PlanFailed, run, plan(to="not-an-email"), log=quiet)
+    assert e.step == "mail" and e.undone == ["hold", "find"] and clean()
+
+    # 3. human declines; confirm sees only permanent steps, with references resolved
+    seen = []
+    e = expect(PlanFailed, run, plan(), confirm=lambda st: seen.extend(st) or False, log=quiet)
+    assert e.step == "confirm" and [s["id"] for s in seen] == ["cancel", "mail"] and clean()
+    assert seen[1]["args"]["body"] == "held {'flight': 'AI101'}"
+
+    # 4. Ctrl+C mid-run still unwinds, then propagates
+    @tool(undo=NOOP)
+    def interrupt():
+        raise KeyboardInterrupt
+    expect(KeyboardInterrupt, run, plan()[1:3] + [{"id": "x", "tool": "interrupt", "after": ["hold"]}], log=quiet)
+    assert clean()
+
+    # 5. an undo that fails is reported, and unwinding continues
+    @tool(undo=lambda r: 1 / 0)
+    def fragile():
+        return "f"
+    e = expect(PlanFailed, run, [{"id": "f", "tool": "fragile"}] + plan(to="bad")[1:], log=quiet)
+    assert e.undo_failed == ["f"] and "hold" in e.undone and clean()
+
+    # 6. happy path
+    r = run(plan(), log=quiet)
+    assert db["bookings"] == set() and db["outbox"] == [("me@x.com", "held {'flight': 'AI101'}")]
+    assert r["hold"] == {"flight": "AI101"}
+
+    # --- async tools, async undo/check/confirm, isolated registry ---
+    reg, log2 = {}, []
+
+    async def aundo(r):
+        log2.append(("undo", r))
+
+    async def acheck(x):
+        if x < 0:
+            raise ValueError("negative")
+
+    @tool(undo=aundo, registry=reg)
+    async def reserve(x: int) -> int:
+        """Async undoable tool."""
+        await asyncio.sleep(0)
+        return x * 2
+
+    @tool(check=acheck, registry=reg)
+    async def charge(x: int):
+        """Async permanent tool."""
+        log2.append(("charge", x))
+
+    async def aconfirm(steps):
+        return True
+
+    p = [{"id": "c", "tool": "charge", "args": {"x": "$r"}}, {"id": "r", "tool": "reserve", "args": {"x": 3}}]
+    assert asyncio.run(arun(p, registry=reg, confirm=aconfirm, log=quiet)) == {"r": 6, "c": None}
+    assert log2 == [("charge", 6)] and "reserve" not in TOOLS  # registries don't leak
+    log2.clear()
+    p[1]["args"]["x"] = -1  # charge(-2) fails its async check just-in-time -> async undo runs
+    expect(PlanFailed, lambda: asyncio.run(arun(p, registry=reg, log=quiet)))
+    assert log2 == [("undo", -2)]
+
+    async def inside_loop():
+        return expect(RuntimeError, run, p, registry=reg)
+    assert "await arun" in str(asyncio.run(inside_loop()))
+
+    # --- Transaction: guard an agent loop that calls tools one by one ---
+    db.update(bookings={"OLD1"}, holds=[], seats={"AI101": 1}, outbox=[])
+    with Transaction(log=quiet) as tx:
+        hold = tx.wrap("book_flight")
+        cancel = tx.wrap("cancel_booking")
+        assert hold.__name__ == "book_flight" and "flight" in str(inspect.signature(hold))
+        assert hold("AI101") == {"flight": "AI101"}  # positional args work; runs now
+        assert "Scheduled" in cancel(ref="OLD1") and db["bookings"] == {"OLD1"}  # deferred
+        expect(RuntimeError, cancel, ref="NOPE")  # dry run fails now, agent can react
+    assert db["bookings"] == set() and db["holds"] == ["AI101"]  # committed on clean exit
+
+    db.update(bookings={"OLD1"}, holds=[], seats={"AI101": 1})
     try:
-        run(plan(flight="XX999"), log=lambda m: None)
-        raise AssertionError("should fail")
-    except PlanFailed as e:
-        assert e.step == "hold" and e.committed == []
-    assert db["bookings"] == {"OLD1"}
+        with Transaction(log=quiet) as tx:
+            tx.call("book_flight", flight="AI101")
+            tx.call("cancel_booking", ref="OLD1")
+            raise RuntimeError("agent crashed")
+    except RuntimeError:
+        pass
+    assert clean()  # rolled back, deferred cancel never ran
 
-    # 2. Bad email caught by dry-run: seat released, nothing permanent happened.
-    try:
-        run(plan(to="not-an-email"), log=lambda m: None)
-        raise AssertionError("should fail")
-    except PlanFailed as e:
-        assert e.step == "mail" and e.undone == ["hold", "find"] and e.committed == []
-    assert db["bookings"] == {"OLD1"} and db["seats"]["AI101"] == 1 and not db["holds"]
+    tx = Transaction(confirm=lambda st: False, log=quiet)
+    tx.call("book_flight", flight="AI101")
+    tx.call("cancel_booking", ref="OLD1")
+    e = expect(PlanFailed, tx.commit)
+    assert e.step == "confirm" and clean()
 
-    # 3. Human says no at the gate: same full rollback.
-    try:
-        run(plan(), confirm=lambda steps: False, log=lambda m: None)
-        raise AssertionError("should fail")
-    except PlanFailed as e:
-        assert e.step == "confirm"
-    assert db["seats"]["AI101"] == 1 and db["bookings"] == {"OLD1"}
+    async def async_agent():  # async framework calling a sync tool on the loop thread
+        async with Transaction(registry=reg, log=quiet) as atx:
+            assert await atx.wrap("reserve")(5) == 10
+            assert "Scheduled" in await atx.acall("charge", x=1)
+        sync_tx = Transaction(log=quiet)
+        assert sync_tx.wrap("search")("BLR-DEL") == ["AI101"]
+    log2.clear()
+    asyncio.run(async_agent())
+    assert log2 == [("charge", 1)]
 
-    # 4. Happy path.
-    r = run(plan(), confirm=lambda steps: print("commit:", [s["id"] for s in steps]) or True)
-    assert db["bookings"] == set() and db["outbox"] == [("me@x.com", ("H", "AI101"))]
+    # --- tool descriptions for models ---
+    spec = {t["name"]: t for t in tools_for_llm()}
+    assert spec["cancel_booking"]["reversible"] is False and spec["search"]["reversible"] is True
+    assert spec["book_flight"]["parameters"] == {"type": "object", "required": ["flight"],
+        "properties": {"flight": {"type": "string"}, "note": {"type": "string"}}}
+    assert spec["book_flight"]["description"] == "Hold a seat (can be released)."
     print("all checks passed")
