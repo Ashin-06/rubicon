@@ -1,14 +1,18 @@
 """Live demo: a real LLM plans against fake in-memory travel tools (no real bookings or emails).
 
-    python demo.py           # Gemini, needs GEMINI_API_KEY or GOOGLE_API_KEY
-    python demo.py claude    # Claude, needs ANTHROPIC_API_KEY
+    python demo.py                 # Gemini   (GEMINI_API_KEY or GOOGLE_API_KEY)
+    python demo.py claude          # Claude   (ANTHROPIC_API_KEY)
+    python demo.py openai          # any OpenAI-compatible API (OPENAI_MODEL, optional
+                                   # OPENAI_BASE_URL / OPENAI_API_KEY; e.g. Ollama needs no key)
+
+Keys can live in a .env file next to this script (git-ignored).
 """
 import json
 import os
 import sys
+from functools import partial
 from pathlib import Path
 
-# Load KEY=value lines from .env next to this file (so the key never goes in chat or code).
 env = Path(__file__).with_name(".env")
 if env.exists():
     for line in env.read_text().splitlines():
@@ -16,21 +20,25 @@ if env.exists():
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
-from rubicon import NOOP, tool
-from rubicon_llm import ask_human, plan_with_claude, plan_with_gemini, run
-
-planner = plan_with_claude if sys.argv[1:] == ["claude"] else plan_with_gemini
+from rubicon import NOOP, PlanFailed, run, tool
+from rubicon_llm import ask_human, plan_with_claude, plan_with_gemini, plan_with_openai
 
 db = {"bookings": {"OLD1"}, "seats": {"AI101": 2, "AI202": 0}, "holds": [], "outbox": []}
+reg = {}
 
 
-@tool(undo=NOOP)
+@tool(undo=NOOP, registry=reg)
 def search_flights(route: str) -> list:
     """List flights on a route that have free seats."""
     return [f for f, n in db["seats"].items() if n > 0]
 
 
-@tool(undo=lambda r: (db["holds"].remove(r["flight"]), db["seats"].__setitem__(r["flight"], db["seats"][r["flight"]] + 1)))
+def release(hold):
+    db["holds"].remove(hold["flight"])
+    db["seats"][hold["flight"]] += 1
+
+
+@tool(undo=release, registry=reg)
 def hold_seat(flight: str) -> dict:
     """Hold a seat on a flight. Can be released."""
     if db["seats"].get(flight, 0) < 1:
@@ -40,32 +48,46 @@ def hold_seat(flight: str) -> dict:
     return {"flight": flight}
 
 
-def _must_exist(ref):
+def booking_exists(ref):
     if ref not in db["bookings"]:
         raise RuntimeError(f"no booking {ref}")
 
 
-@tool(check=_must_exist)
+@tool(check=booking_exists, registry=reg)
 def cancel_booking(ref: str) -> str:
     """Cancel an existing booking. PERMANENT."""
     db["bookings"].remove(ref)
     return "cancelled"
 
 
-def _valid(to, body):
+def valid_address(to, body):
     if "@" not in to:
         raise RuntimeError(f"bad address {to}")
 
 
-@tool(check=_valid)
+@tool(check=valid_address, registry=reg)
 def send_email(to: str, body: str) -> str:
     """Send an email. PERMANENT."""
     db["outbox"].append((to, body))
     return "sent"
 
 
-plan = planner("Move my BLR-DEL booking OLD1 to flight AI101 and email me@x.com to confirm.")
+provider = sys.argv[1] if len(sys.argv) > 1 else "gemini"
+planners = {
+    "gemini": plan_with_gemini,
+    "claude": plan_with_claude,
+    "openai": lambda goal, client, registry: plan_with_openai(
+        goal, client, registry, model=os.environ["OPENAI_MODEL"], base_url=os.environ.get("OPENAI_BASE_URL")),
+}
+if provider not in planners:
+    sys.exit(f"unknown provider {provider!r}; choose one of {sorted(planners)}")
+
+goal = "Move my BLR-DEL booking OLD1 to flight AI101 and email me@x.com to confirm."
+plan = planners[provider](goal, None, reg)
 print("Plan:\n" + json.dumps(plan, indent=1))
-results = run(plan, confirm=ask_human)
-print("results:", results)
+try:
+    results = run(plan, registry=reg, confirm=ask_human)
+    print("results:", results)
+except PlanFailed as e:
+    print("rolled back:", e)
 print("final state:", db)
