@@ -374,6 +374,12 @@ Each report is `{"tx", "undone", "undo_failed", "committed", "uncertain", "needs
 "kept"}`. Only one `recover()` runs per journal at a time; a second one raises `JournalBusy`
 instead of undoing the same step twice.
 
+`recover()` is safe to run while other workers are using the same journal. Each transaction
+records which process and machine runs it, and `recover()` leaves alone any transaction whose
+process is still alive on this machine, or that belongs to another machine (it can't check
+that from here). Run `recover()` on each machine, or pass `include_live=True` when you know the
+other processes are gone.
+
 ### Where the journal lives
 
 ```python
@@ -411,6 +417,8 @@ acknowledge(journal, tx)          # the whole transaction is handled as it is
 - A failed undo is retried by every `recover()` run until it succeeds or is acknowledged.
 - For a crash during a permanent step, acknowledge just that step if it did not happen, and the
   next `recover()` undoes the steps it was keeping; acknowledge the whole transaction if it did.
+- `acknowledge()` raises `ValueError` for a transaction or step the journal doesn't contain, so
+  a typo can't leave the real dead letter open.
 
 ### Keeping the journal small
 
@@ -476,7 +484,7 @@ OPENAI_MODEL=llama3.3 OPENAI_BASE_URL=http://localhost:11434/v1 python demo.py o
 | `NOOP` | Undo function for read-only tools. |
 | `run(plan, registry=None, confirm=None, log=None, *, parallel=False, on_event=None, journal=None)`, `arun(...)` | Run a plan and return `{step_id: result}`. |
 | `Transaction(registry=None, confirm=None, log=None, *, on_event=None, journal=None)` | Guard an agent loop. Methods: `call`/`acall`, `commit`/`acommit`, `rollback`/`arollback`, `wrap(name)`, `wrap_all()`. Attributes: `results`, `committed`, `undone`, `undo_failed`. Works as a sync or async context manager. |
-| `recover(journal, registry=None, log=None, *, on_dead_letter=None)`, `arecover(...)` | Undo transactions a crash left unfinished. Returns one report per transaction (see [crash recovery](#parallel-steps-events-and-crash-recovery)). Safe to run repeatedly. |
+| `recover(journal, registry=None, log=None, *, on_dead_letter=None, include_live=False)`, `arecover(...)` | Undo transactions a crash left unfinished, leaving running ones alone. Returns one report per transaction (see [crash recovery](#parallel-steps-events-and-crash-recovery)). Safe to run repeatedly and alongside live workers. |
 | `dead_letters(journal)` | Steps that need a person, until resolved. |
 | `acknowledge(journal, tx, step=None, note="")` | Mark a dead letter (or a whole transaction) as handled. |
 | `compact(journal)` | Remove settled transactions; returns how many. |
@@ -527,7 +535,11 @@ OPENAI_MODEL=llama3.3 OPENAI_BASE_URL=http://localhost:11434/v1 python demo.py o
   unwound. With it, run `recover()` on startup and alert on `dead_letters()`.
 - The built-in journals cover one machine. Across machines, use a shared store through your own
   journal object, and give it a `lock()` that works across machines if more than one of them may
-  run `recover()`.
+  run `recover()`. `recover()` only checks process liveness on its own machine, so it skips other
+  machines' transactions unless you pass `include_live=True`.
+- Liveness is checked by process id. If the operating system reuses a crashed process's id for a
+  new process, that transaction is skipped until the new process exits: a delay, never a wrong
+  undo.
 - A sync undo that hangs can't be interrupted. Give remote calls their own timeouts, or make the
   undo async so `timeout=` applies.
 - Keep keys out of the repo. `.env` is git-ignored; `.env.example` is the template.

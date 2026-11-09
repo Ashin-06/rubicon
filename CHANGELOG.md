@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.8.0
+
+### Changed
+- `recover()` leaves alone any transaction that may still be running: its process is alive on
+  this machine, or it belongs to another machine. Before, a `recover()` started while other
+  workers used the same journal (the multi-process setup `SQLiteJournal` is meant for) would undo
+  their live work. Each transaction now records its process id and host. Pass
+  `include_live=True` to recover other machines' transactions when you know they are gone.
+- `acknowledge()` raises `ValueError` for a transaction or step the journal doesn't contain.
+
+### Fixed
+- `FileJournal.records()` read without the write lock. On Windows, `compact()` could fail with
+  `PermissionError` while another process was reading, and a reader could see a line still being
+  written. Reads now take the write lock.
+- `compact()` never removed a rolled-back transaction whose last failed undo was resolved with
+  `acknowledge(journal, tx, step)`. Such a transaction now counts as finished.
+- An "uncertain" step was reported again, with another warning, on every `recover()` run while
+  another undo in the same transaction kept failing. It is now reported once.
+- A `with Transaction(journal=...)` block that committed or rolled back inside it wrote a second
+  "finished" record on exit, and an empty block wrote records at all. Settle records are now
+  written only when steps ran since the last one.
+- `SQLiteJournal.drop()` now deletes all chunks in one transaction.
+- Plan parsing: bracketed text in the prose before the plan (for example "See note [1]") no
+  longer hides the real plan, for JSON and Python-style output alike.
+- Plan repair: two argument keys that both match one parameter are left alone instead of
+  renaming one of them; NaN no longer produces a bogus repair or becomes the string "nan";
+  `"after"` values that are falsy but not a list (`""`, `0`, `{}`) are rejected instead of
+  being read as an empty list; repairs are logged only for plans that are accepted.
+- The demo reads `.env` as UTF-8.
+
 ## 0.7.0
 
 ### Added
