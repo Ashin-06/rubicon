@@ -8,16 +8,66 @@ Works with the MCP Python SDK 1.x (ClientSession) and 2.x (ClientSession or Clie
     results = await arun(plan)                      # or: async with Transaction() as tx
 
 Labelling (names in `undo` / `checks` are the server's own tool names, without `prefix`):
-  - listed in `undo`                     -> undoable with that undo(result) (sync or async)
+  - listed in `undo`                     -> undoable with undo(result) or undo(result, args)
   - readOnlyHint=true and trust_readonly -> undoable (nothing to undo)
   - everything else                      -> permanent (MCP's own default: assume destructive)
 MCP annotations are the server's *claims*: a lying server could mark a destructive tool
 read-only, so read-only tools run before the safety gate only with trust_readonly=True.
+
+Each registered tool gets a real Python signature built from its input schema (keyword-only
+parameters with type annotations), so agent frameworks that inspect signatures see the actual
+parameters. Checks are called with keyword arguments.
 """
+from __future__ import annotations
+
 import inspect
 import json
+import keyword
+import typing
 
 from rubicon import NOOP, TOOLS, Tool
+
+__all__ = ["list_all_tools", "register_mcp"]
+
+_PY_TYPES = {"string": str, "integer": int, "number": float, "boolean": bool, "array": list, "object": dict}
+
+
+class _Unset:
+    """Default for optional MCP parameters: left out of the call instead of sent as null."""
+
+    def __repr__(self):
+        return "<unset>"
+
+
+_UNSET = _Unset()
+
+
+def _signature(schema):
+    """A keyword-only Python signature for a JSON input schema, or None if the property names
+    aren't valid Python identifiers."""
+    schema = schema or {}
+    props = dict(schema.get("properties") or {})
+    for name in schema.get("required") or []:
+        props.setdefault(name, {})
+    if not all(n.isidentifier() and not keyword.iskeyword(n) for n in props):
+        return None
+    required = set(schema.get("required") or [])
+
+    def annotation(name):
+        t = (props[name] or {}).get("type")
+        return _PY_TYPES.get(t, typing.Any) if isinstance(t, str) else typing.Any
+
+    kw = inspect.Parameter.KEYWORD_ONLY
+    params = [inspect.Parameter(n, kw, annotation=annotation(n)) for n in props if n in required]
+    params += [inspect.Parameter(n, kw, default=_UNSET, annotation=annotation(n)) for n in props if n not in required]
+    if schema.get("additionalProperties", True) is not False:
+        extra = next(n for n in ("extra", "extra_args", "_extra") if n not in props)
+        params.append(inspect.Parameter(extra, inspect.Parameter.VAR_KEYWORD))
+    return inspect.Signature(params)
+
+
+def _not_json(constant):
+    raise ValueError(constant)
 
 
 def _field(obj, *names):
@@ -60,21 +110,42 @@ async def register_mcp(session, *, prefix="", trust_readonly=False, undo=None, c
 
     async def call(name, **args):
         r = await session.call_tool(name, args)
-        text = "\n".join(c.text for c in (r.content or []) if getattr(c, "text", None) is not None)
+        content = r.content or []
+        text = "\n".join(c.text for c in content if getattr(c, "text", None) is not None)
         if _field(r, "is_error", "isError"):
             raise RuntimeError(f"{name}: {text}")
         structured = _field(r, "structured_content", "structuredContent")
         if structured is not None:
             return structured
-        try:  # many servers return JSON as plain text
-            return json.loads(text)
+        if not text and content:  # images, audio, resources: return them instead of ""
+            return [c.model_dump(mode="json", exclude_none=True) if hasattr(c, "model_dump") else c
+                    for c in content]
+        try:  # many servers return JSON as plain text; "NaN"/"Infinity" stay text
+            return json.loads(text, parse_constant=_not_json)
         except ValueError:
             return text
 
     def proxy(name, description, schema):
-        async def fn(**args):
+        sig = _signature(schema)
+
+        async def fn(*a, **k):
+            if sig is None:
+                return await call(name, **k)
+            bound = sig.bind(*a, **k)
+            args = {}
+            for key, value in bound.arguments.items():
+                if sig.parameters[key].kind is inspect.Parameter.VAR_KEYWORD:
+                    args.update(value)
+                elif value is not _UNSET:
+                    args[key] = value
             return await call(name, **args)
-        fn.__name__, fn.__doc__, fn.input_schema = name, description, schema
+
+        fn.__name__ = fn.__qualname__ = prefix + name
+        fn.__doc__, fn.input_schema = description, schema
+        if sig is not None:
+            fn.__signature__ = sig
+            fn.__annotations__ = {p.name: p.annotation for p in sig.parameters.values()
+                                  if p.annotation is not inspect.Parameter.empty}
         return fn
 
     server_tools = await list_all_tools(session)
@@ -146,6 +217,10 @@ if __name__ == "__main__":
         db["outbox"].append(to)
         return "sent"
 
+    @srv.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    def tag_of(text: str, tag: str = "default") -> dict:
+        return {"tag": tag}
+
     def plan(flight="AI101", to="me@x.com"):  # naive order: cancel first
         return [
             {"id": "cancel", "tool": "cancel_booking", "args": {"ref": "OLD1"}},
@@ -179,12 +254,35 @@ if __name__ == "__main__":
             reg = {}
             call = await register_mcp(
                 session, registry=reg, trust_readonly=True,
-                undo={"hold_seat": lambda r: call("release_seat", flight=r["flight"])},  # async undo
+                # async undo that uses the call's arguments rather than its result
+                undo={"hold_seat": lambda result, args: call("release_seat", flight=args["flight"])},
                 checks={"send_email": valid_to})
             assert [s["id"] for s in order(plan(), reg)] == ["find", "hold", "cancel", "mail"]
             spec = {t["name"]: t for t in tools_for_llm(reg)}
             assert spec["hold_seat"]["parameters"]["required"] == ["flight"]
             assert spec["search"]["description"] == "Find flights with free seats."
+
+            # Real signatures: keyword-only, annotated, visible through Transaction.wrap.
+            sig = inspect.signature(reg["hold_seat"].fn)
+            assert sig.parameters["flight"].kind is inspect.Parameter.KEYWORD_ONLY
+            assert sig.parameters["flight"].annotation is str
+            assert "flight" in str(inspect.signature(Transaction(registry=reg).wrap("hold_seat")))
+            # Hallucinated or missing arguments are rejected before anything runs.
+            for bad in ({"flght": "AI101"}, {}):
+                try:
+                    order([{"id": "h", "tool": "hold_seat", "args": bad}], reg)
+                    raise AssertionError("bad args should be rejected")
+                except ValueError:
+                    pass
+            # Optional parameters left out are omitted, so the server's default applies.
+            assert await reg["tag_of"].fn(text="x") == {"tag": "default"}
+            assert await reg["tag_of"].fn(text="x", tag="t") == {"tag": "t"}
+
+            # Prefixes reach the function name, so wrapped tools from two servers don't collide.
+            gh = {}
+            await register_mcp(session, registry=gh, prefix="gh_")
+            assert set(gh) == {"gh_" + n for n in reg} and gh["gh_hold_seat"].fn.__name__ == "gh_hold_seat"
+            assert Transaction(registry=gh).wrap("gh_search").__name__ == "gh_search"
 
             # Server-side error (no seats) -> nothing permanent happens.
             try:
@@ -240,4 +338,30 @@ if __name__ == "__main__":
     for style in ("params", "cursor"):
         assert [t.name for t in asyncio.run(list_all_tools(Pages(style)))] == ["a", "b", "c", "d"]
     assert [t.name for t in asyncio.run(list_all_tools(Pages("cursor", loop_forever=True)))] == ["a", "b", "c"]
+
+    # Result parsing: "NaN" stays text, JSON text is parsed, non-text content is returned.
+    class Stub:
+        def __init__(self, content):
+            self.content = content
+
+        async def list_tools(self):
+            return NS(tools=[NS(name="t", description="", annotations=None, inputSchema=None)], nextCursor=None)
+
+        async def call_tool(self, name, args):
+            return NS(content=self.content, isError=False, structuredContent=None)
+
+    async def result_of(content):
+        call = await register_mcp(Stub(content), registry={})
+        return await call("t")
+
+    assert asyncio.run(result_of([NS(text="NaN")])) == "NaN"
+    assert asyncio.run(result_of([NS(text="Infinity")])) == "Infinity"
+    assert asyncio.run(result_of([NS(text='{"a": 1}')])) == {"a": 1}
+    image = NS(type="image", data="aGk=", mimeType="image/png")
+    assert asyncio.run(result_of([image])) == [image]
+
+    # Property names that aren't Python identifiers fall back to **kwargs.
+    assert _signature({"properties": {"user-id": {"type": "string"}}}) is None
+    assert str(_signature({"properties": {"a": {"type": "integer"}}, "required": ["a"],
+                           "additionalProperties": False})) == "(*, a: int)"
     print("all MCP checks passed")
