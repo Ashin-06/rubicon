@@ -26,11 +26,22 @@ import os
 
 from rubicon import TOOLS, arun, order, run, tools_for_llm
 
-__all__ = ["CLAUDE_MODEL", "GEMINI_MODEL", "SYSTEM", "aagent", "agent", "ask_human", "parse_plan",
-           "plan_schema", "plan_with_claude", "plan_with_gemini", "plan_with_openai", "planning_request"]
+__all__ = ["CLAUDE_MODEL", "GEMINI_MODEL", "PlanRejected", "SYSTEM", "aagent", "agent", "ask_human",
+           "parse_plan", "plan_schema", "plan_with_claude", "plan_with_gemini", "plan_with_openai",
+           "planning_request"]
 
-GEMINI_MODEL = "gemini-3.5-flash"  # measured 2026-11-08: ~10s per plan; flash-latest / 3.8 timed out
-CLAUDE_MODEL = "claude-opus-5-5"
+# Defaults can be overridden with environment variables (or a .env loaded before import).
+# gemini-3.5-flash measured 2026-11-08 at ~10s per plan; flash-latest and 3.8 timed out then.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL") or "gemini-3.5-flash"
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL") or "claude-opus-5-5"
+
+
+class PlanRejected(ValueError):
+    """A model's plan failed parsing or validation. `text` is what the model wrote."""
+
+    def __init__(self, message, text):
+        super().__init__(message)
+        self.text = text
 
 SYSTEM = """You turn a goal into a plan of tool calls for an agent.
 Each tool is labelled reversible or not. The executor runs reversible steps first and permanent \
@@ -98,7 +109,15 @@ def parse_plan(text, registry=None):
     """Model output -> validated plan.
 
     Accepts {"steps": [...]} or a bare [...] list, with "args_json" (a JSON string) or "args".
+    Raises PlanRejected (a ValueError) carrying the model's text.
     """
+    try:
+        return _parse_plan(text, registry)
+    except ValueError as e:  # includes json.JSONDecodeError
+        raise PlanRejected(str(e), text) from e
+
+
+def _parse_plan(text, registry):
     data = _loads(text)
     steps = data if isinstance(data, list) else data.get("steps") if isinstance(data, dict) else None
     if not isinstance(steps, list):
@@ -220,7 +239,15 @@ def ask_human(steps):
 
 
 def _retry_goal(goal, error):
-    return f"{goal}\n\nYour previous plan was rejected: {error}\nWrite a corrected plan."
+    """The goal again, with the rejected plan and the reason, since planners are single-turn."""
+    previous = getattr(error, "text", None)
+    shown = f"\n\nYour previous plan was:\n{previous[:4000]}" if previous else ""
+    return f"{goal}{shown}\n\nIt was rejected: {error}\nWrite a corrected plan."
+
+
+def _check_attempts(attempts):
+    if not isinstance(attempts, int) or attempts < 1:
+        raise ValueError(f"attempts must be a whole number of at least 1, got {attempts!r}")
 
 
 def agent(goal, planner=plan_with_gemini, client=None, registry=None, confirm=ask_human, log=print,
@@ -231,6 +258,7 @@ def agent(goal, planner=plan_with_gemini, client=None, registry=None, confirm=as
     sent back to the model for a corrected plan, up to `attempts` plans in total. run_kwargs go
     to run(): parallel=, on_event=, journal=.
     """
+    _check_attempts(attempts)
     error = None
     for n in range(attempts):
         try:
@@ -250,6 +278,8 @@ async def aagent(goal, planner=plan_with_gemini, client=None, registry=None, con
     The planner may be sync (run in a thread) or async. A sync confirm, such as the default
     terminal prompt, runs in a thread so it doesn't block the event loop.
     """
+    _check_attempts(attempts)
+
     async def make_plan(g):
         if inspect.iscoroutinefunction(planner):
             return await planner(g, client, registry)
@@ -418,8 +448,13 @@ if __name__ == "__main__":
         return parse_plan(json.dumps([{"id": "c", "tool": "cancel_booking", "args_json": args}]), registry)
     agent("cancel OLD1", planner=picky, registry=reg, confirm=lambda st: True, log=quiet)
     assert len(goals) == 2 and "rejected" in goals[1] and "booking_id" in goals[1]
+    assert '"args_json": "{\\"booking_id\\"' in goals[1]  # the model sees the plan it wrote
     goals.clear()
-    expect(ValueError, agent, "x", planner=picky, registry=reg, attempts=1, log=quiet)
+    e = expect(PlanRejected, agent, "x", planner=picky, registry=reg, attempts=1, log=quiet)
+    assert isinstance(e, ValueError) and "booking_id" in e.text
+    for bad_attempts in (0, -1, 1.5):
+        expect(ValueError, agent, "x", planner=picky, registry=reg, attempts=bad_attempts, log=quiet)
+    expect(ValueError, lambda: asyncio.run(aagent("x", planner=picky, registry=reg, attempts=0, log=quiet)))
     assert state["cancelled"] == ["OLD1"] * 4
 
     # Async agent: sync confirm runs off the event loop thread; async planners are awaited.
