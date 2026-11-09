@@ -146,7 +146,7 @@ def _loads(text, repairs=None):
     try:
         return json.loads(t)
     except ValueError:
-        pass
+        pass  # not bare JSON: look for JSON inside prose or fences below
     decoder = json.JSONDecoder()
 
     def candidates():
@@ -283,7 +283,7 @@ def _parse_plan(text, registry, repairs):
                     args = json.loads(args)
                     repairs.append(f"step {s.get('id')!r}: decoded doubly-encoded args_json")
                 except ValueError:
-                    pass
+                    pass  # a plain string, not encoded twice: order() reports it as invalid args
         elif isinstance(raw, dict):
             args = raw
         after = s.get("after")
@@ -312,6 +312,7 @@ def plan_with_gemini(goal, client=None, registry=None, model=None):
         model=model,
         contents=req["prompt"],
         config=types.GenerateContentConfig(
+            max_output_tokens=16000,  # bounds cost; a plan is far smaller, and a cut-off one is rejected
             system_instruction=req["system"],
             response_mime_type="application/json",
             response_json_schema=req["schema"],
@@ -537,6 +538,7 @@ if __name__ == "__main__":
     assert seen == ["c"] and state == {"held": 1, "cancelled": ["OLD1"]}
     cfg = g.kw["config"]  # a real GenerateContentConfig, so field names are validated by the SDK
     assert g.kw["model"] == GEMINI_MODEL and cfg.response_mime_type == "application/json"
+    assert cfg.max_output_tokens == 16000  # output (and its cost) is bounded
     assert cfg.response_json_schema["properties"]["steps"]["items"]["properties"]["tool"]["enum"] == \
         ["cancel_booking", "hold_seat", "search"]
     assert '"reversible": false' in g.kw["contents"] and '"type": "string"' in g.kw["contents"]
