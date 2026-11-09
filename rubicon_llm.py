@@ -284,7 +284,7 @@ def _parse_plan(text, registry, repairs):
                     repairs.append(f"step {s.get('id')!r}: decoded doubly-encoded args_json")
                 except ValueError:
                     pass  # a plain string, not encoded twice: order() reports it as invalid args
-        elif isinstance(raw, dict):
+        elif raw is not None and not isinstance(raw, str):  # an object, or a list/number order() rejects
             args = raw
         after = s.get("after")
         plan.append({"id": s.get("id"), "tool": s.get("tool"),
@@ -599,6 +599,10 @@ if __name__ == "__main__":
                 json.dumps({"steps": [{**naive[0], "args_json": '{"booking_id": "OLD1"}'}]})]:
         expect(ValueError, parse_plan, bad, reg)
     expect(ValueError, planning_request, "x", {})  # nothing to plan with
+    bare = {}
+    tool(lambda: 1, name="ping", undo=NOOP, registry=bare)
+    for not_args in ([1, 2], 3, True):  # args_json that is not an object is refused, never read as {}
+        expect(ValueError, parse_plan, json.dumps([{"id": "a", "tool": "ping", "args_json": not_args}]), bare)
 
     # Lenient parsing: braces in trailing prose, bare lists, empty args_json, null after.
     fenced = "Here is the plan:\n```json\n" + text + "\n```\nNote: replaces {OLD1}."
