@@ -85,10 +85,13 @@ if provider not in planners:
     sys.exit(f"unknown provider {provider!r}; choose one of {sorted(planners)}")
 
 goal = "Move my BLR-DEL booking OLD1 to flight AI101 and email me@x.com to confirm."
-plan = planners[provider](goal, None, reg)
+try:
+    plan = planners[provider](goal, None, reg)
+except Exception as e:  # quota, network, refusal, a plan that stayed invalid...
+    sys.exit(f"the {provider} planner failed: {type(e).__name__}: {str(e)[:300]}")
 print("Plan:\n" + json.dumps(plan, indent=1))
 try:
-    results = run(plan, registry=reg, confirm=ask_human)
+    results = run(plan, registry=reg, confirm=ask_human, log=print)
     print("results:", results)
 except PlanFailed as e:
     print("rolled back:", e)
