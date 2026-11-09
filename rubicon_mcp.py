@@ -50,7 +50,11 @@ def _signature(schema):
     kw = inspect.Parameter.KEYWORD_ONLY
     params = [inspect.Parameter(n, kw, annotation=annotation(n)) for n in props if n in required]
     params += [inspect.Parameter(n, kw, default=UNSET, annotation=annotation(n)) for n in props if n not in required]
-    if schema.get("additionalProperties", True) is not False:
+    # Extra arguments only when the schema explicitly allows them, or declares no properties at
+    # all. Many servers leave out additionalProperties; accepting anything there would let a
+    # hallucinated argument slip through, where the server may silently ignore it.
+    extras = schema.get("additionalProperties")
+    if extras is True or isinstance(extras, dict) or not props:
         extra = next(n for n in ("extra", "extra_args", "_extra") if n not in props)
         params.append(inspect.Parameter(extra, inspect.Parameter.VAR_KEYWORD))
     return inspect.Signature(params)
@@ -71,7 +75,10 @@ def _field(obj, *names):
 
 async def list_all_tools(session):
     """Every tool on the server, following pagination (SDK 1.x and 2.x)."""
-    by_params = "params" in inspect.signature(session.list_tools).parameters
+    try:
+        by_params = "params" in inspect.signature(session.list_tools).parameters
+    except (TypeError, ValueError):  # signature not inspectable: SDK 1.x/2.x sessions take params=
+        by_params = True
     tools, cursor, seen = [], None, set()
     while True:
         if cursor is None:
@@ -157,6 +164,7 @@ if __name__ == "__main__":
     import asyncio
     import os
     import tempfile
+    from pathlib import Path
     from types import SimpleNamespace as NS
 
     from mcp.types import ToolAnnotations
@@ -264,9 +272,10 @@ if __name__ == "__main__":
                        confirm=lambda st: shown.extend(st) or True, journal=journal)
             assert noted == ["a@b"] and shown[0]["args"] == {"to": "a@b"}
             assert db["outbox"].pop() == ("a@b", "nobody")  # server default applied
-            records = [json.loads(line) for line in open(journal)]
+            text = Path(journal).read_text(encoding="utf-8")
+            records = [json.loads(line) for line in text.splitlines()]
             assert next(r for r in records if r["event"] == "done")["args"] == {"text": "x"}
-            assert "UNSET" not in open(journal).read() and "unserializable" not in open(journal).read()
+            assert "UNSET" not in text and "unserializable" not in text
             assert [s["id"] for s in order(plan(), reg)] == ["find", "hold", "cancel", "mail"]
             spec = {t["name"]: t for t in tools_for_llm(reg)}
             assert spec["hold_seat"]["parameters"]["required"] == ["flight"]
@@ -374,4 +383,38 @@ if __name__ == "__main__":
     assert _signature({"properties": {"user-id": {"type": "string"}}}) is None
     assert str(_signature({"properties": {"a": {"type": "integer"}}, "required": ["a"],
                            "additionalProperties": False})) == "(*, a: int)"
+    # Without additionalProperties, unknown (hallucinated) arguments are rejected; extras only
+    # when the schema allows them or declares no properties.
+    plain = {"type": "object", "properties": {"flight": {"type": "string"}}, "required": ["flight"]}
+    assert str(_signature(plain)) == "(*, flight: str)"
+    assert "**extra" in str(_signature({**plain, "additionalProperties": True}))
+    assert "**extra" in str(_signature({**plain, "additionalProperties": {"type": "string"}}))
+    assert str(_signature({"type": "object"})) == "(**extra)"
+
+    async def fake(*a, **k):
+        pass
+    fake.__signature__ = _signature(plain)
+    try:
+        order([{"id": "h", "tool": "hold", "args": {"flight": "AI101", "seat_class": "first"}}],
+              {"hold": Tool(fake)})
+        raise AssertionError("unknown argument should be rejected")
+    except ValueError:
+        pass
+
+    # A session whose list_tools signature can't be inspected still lists every page.
+    class Opaque:
+        def __init__(self):
+            self.inner = Pages("params")
+
+        @property
+        def list_tools(self):
+            inner = self.inner.list_tools
+
+            class Callable:
+                __signature__ = property(lambda s: (_ for _ in ()).throw(ValueError("no signature")))
+
+                async def __call__(self, **kw):
+                    return await inner(**kw)
+            return Callable()
+    assert [t.name for t in asyncio.run(list_all_tools(Opaque()))] == ["a", "b", "c", "d"]
     print("all MCP checks passed")
