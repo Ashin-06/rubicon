@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from graphlib import CycleError, TopologicalSorter
 from typing import Callable
 
-__all__ = ["NOOP", "PlanFailed", "TOOLS", "Tool", "Transaction", "arecover", "arun", "order",
+__all__ = ["NOOP", "PlanFailed", "TOOLS", "Tool", "Transaction", "UNSET", "arecover", "arun", "order",
            "recover", "run", "tool", "tools_for_llm"]
 
 RETRY_DELAY = 0.2  # seconds before the first retry; doubles each attempt
@@ -48,6 +48,21 @@ RETRY_DELAY = 0.2  # seconds before the first retry; doubles each attempt
 
 def NOOP(result):
     """Undo for read-only tools: there is nothing to reverse."""
+
+
+class _Unset:
+    __slots__ = ()
+
+    def __repr__(self):
+        return "UNSET"
+
+    def __bool__(self):
+        return False
+
+
+UNSET = _Unset()
+"""Default for an optional parameter that should be left out of the call entirely (not passed,
+not shown at confirmation, not journaled), e.g. so a remote API applies its own default."""
 
 
 @dataclass
@@ -257,6 +272,8 @@ def _prepare(fn, args=(), kwargs=None):
         args = tuple(kwargs.pop(p.name) for p in params if p.kind is p.POSITIONAL_ONLY and p.name in kwargs)
     bound = sig.bind(*args, **kwargs)
     bound.apply_defaults()
+    for name in [n for n, v in bound.arguments.items() if v is UNSET]:
+        del bound.arguments[name]  # left out entirely: the function's own default applies
     view = {}
     for name, value in bound.arguments.items():
         if sig.parameters[name].kind is inspect.Parameter.VAR_KEYWORD:
@@ -264,6 +281,22 @@ def _prepare(fn, args=(), kwargs=None):
         else:
             view[name] = value
     return bound.args, bound.kwargs, view
+
+
+def _fit(check, args, kwargs, view):
+    """Arguments for a check: the tool's arguments, limited to the parameters the check accepts,
+    so a check can ignore optional parameters it doesn't care about."""
+    try:
+        params = inspect.signature(check).parameters.values()
+    except (TypeError, ValueError):
+        return args, kwargs
+    if any(p.kind is p.VAR_POSITIONAL for p in params):
+        return args, kwargs
+    if not any(p.kind is p.VAR_KEYWORD for p in params):
+        names = {p.name for p in params}
+        view = {n: v for n, v in view.items() if n in names}
+    a, k, _ = _prepare(check, (), view)
+    return a, k
 
 
 async def _call(fn, *args, **kwargs):
@@ -316,12 +349,28 @@ def _sync(coro, drive=False):
                        "async with Transaction())")
 
 
+_MARK = "__unserializable__"
+
+
 def _jsonable(value):
+    """A JSON-safe copy: only the parts that can't be serialized are replaced by a marker."""
+    if isinstance(value, dict):
+        return {k if isinstance(k, str) else str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
     try:
         json.dumps(value)
         return value
     except (TypeError, ValueError):
-        return {"__unserializable__": repr(value)}
+        return {_MARK: repr(value)}
+
+
+def _has_mark(value) -> bool:
+    if isinstance(value, dict):
+        return _MARK in value or any(_has_mark(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_mark(v) for v in value)
+    return False
 
 
 # ---------------------------------------------------------------------------- planning
@@ -356,9 +405,9 @@ def order(plan, registry=None) -> list[dict]:
             raise ValueError(f"step {sid!r}: after must be a list of step ids")
         t = tools[name]
         try:
-            a, k, _ = _prepare(t.fn, (), args)
+            a, k, view = _prepare(t.fn, (), args)
             if t.check:
-                _prepare(t.check, a, k)
+                _fit(t.check, a, k, view)
         except TypeError as e:
             raise ValueError(f"step {sid!r}: arguments {sorted(args)} don't fit {name}: {e}") from None
         by_id[sid] = s
@@ -470,11 +519,12 @@ class Transaction:
             self.log(f"ran {label}")
         return r
 
-    async def _check(self, label, name, a, k):
+    async def _check(self, label, name, a, k, view):
         t = self._tool(name)
         if not t.check:
             return None
-        preview = await _attempt(t.check, a, k, 0, t.timeout)
+        ca, ck = _fit(t.check, a, k, view)
+        preview = await _attempt(t.check, ca, ck, 0, t.timeout)
         self._emit("check_passed", step=label, tool=name, preview=preview)
         return preview
 
@@ -492,7 +542,7 @@ class Transaction:
         label = self._label(name)
         if t.reversible:
             return await self._run(label, name, a, k, view, permanent=False)
-        preview = await self._check(label, name, a, k)
+        preview = await self._check(label, name, a, k, view)
         self.pending.append({"id": label, "tool": name, "args": view, "preview": preview, "call": (a, k)})
         note = f" Preview: {preview}" if preview is not None else ""
         return (f"Scheduled {name} ({label}): it is a permanent action and will run after "
@@ -520,7 +570,8 @@ class Transaction:
         self.pending.clear()
         self.undone += undone
         self.undo_failed += failed
-        self._write("finished", status="rolled_back")
+        if not failed:  # otherwise leave it unfinished so recover() can retry the failed undos
+            self._write("finished", status="rolled_back")
         if interrupted is not None:
             raise interrupted
         return undone, failed
@@ -616,13 +667,21 @@ async def _waves(tx, steps, deps, execute):
     while remaining:
         wave = [s for sid, s in remaining.items() if set(deps[sid]) & remaining.keys() <= finished]
         tasks = {asyncio.ensure_future(execute(s)): s["id"] for s in wave}
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        try:
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        except BaseException:
+            # we were cancelled or interrupted: stop the wave before anyone rolls back, so no
+            # step can finish after the rollback
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
         for task in pending:
             task.cancel()
         if pending:
-            await asyncio.wait(pending)
+            await asyncio.gather(*pending, return_exceptions=True)
         for task in done:
-            if task.exception() is not None:
+            if not task.cancelled() and task.exception() is not None:
                 raise _StepFailed(tasks[task], task.exception())
         for sid in tasks.values():
             finished.add(sid)
@@ -653,7 +712,7 @@ async def arun(plan, registry=None, confirm=None, log=print, *, parallel=False, 
         a, k, view = call_for(s)
         if perm(s):
             if s["id"] not in previews:  # inputs weren't known before the gate: check now
-                await tx._check(s["id"], s["tool"], a, k)
+                await tx._check(s["id"], s["tool"], a, k, view)
             return await tx._run(s["id"], s["tool"], a, k, view, permanent=True)
         return await tx._run(s["id"], s["tool"], a, k, view, permanent=False)
 
@@ -676,7 +735,7 @@ async def arun(plan, registry=None, confirm=None, log=print, *, parallel=False, 
             known = all(d in results for d in deps[s["id"]])  # includes `after`, not just $refs
             if known:
                 a, k, view = call_for(s)
-                previews[s["id"]] = await tx._check(s["id"], s["tool"], a, k)
+                previews[s["id"]] = await tx._check(s["id"], s["tool"], a, k, view)
             else:
                 view = s.get("args", {})
             permanent.append({"id": s["id"], "tool": s["tool"], "args": view, "preview": previews.get(s["id"])})
@@ -712,8 +771,12 @@ async def arecover(journal, registry=None, log=print) -> list[dict]:
     """Undo transactions that a crash left unfinished, using their journal.
 
     For each unfinished transaction, undoable steps completed after its last commit are undone in
-    reverse order (steps before a commit are part of the committed result and are kept). Returns
-    one report per transaction: {"tx", "undone", "undo_failed", "committed"}.
+    reverse order (steps before a commit are part of the committed result and are kept). Each undo
+    is journaled as it happens, so recovery itself can crash and be run again without undoing
+    anything twice. A transaction is marked finished only when every undo succeeded; run
+    recover() again later to retry the ones in "undo_failed".
+
+    Returns one report per transaction: {"tx", "undone", "undo_failed", "committed"}.
     """
     tools = TOOLS if registry is None else registry
     if not os.path.exists(journal):
@@ -745,26 +808,32 @@ async def arecover(journal, registry=None, log=print) -> list[dict]:
         undone, failed = [], []
         for rec in reversed(tx["done"]):
             t = tools.get(rec["tool"])
-            result = rec.get("result")
+            result, args = rec.get("result"), rec.get("args", {})
             try:
                 if t is None or not t.reversible:
                     raise LookupError(f"tool {rec['tool']!r} is not registered as undoable")
-                if isinstance(result, dict) and "__unserializable__" in result:
-                    raise ValueError("result was not JSON-serializable, so it can't be replayed")
-                args = (result, rec.get("args", {})) if _takes_args(t.undo) else (result,)
-                await _attempt(t.undo, args, {}, t.undo_retries, t.timeout)
+                with_args = _takes_args(t.undo)
+                if _has_mark(result) or (with_args and _has_mark(args)):
+                    raise ValueError("the step's result or arguments weren't JSON-serializable, so "
+                                     "they can't be replayed; undo it by hand")
+                await _attempt(t.undo, (result, args) if with_args else (result,), {}, t.undo_retries, t.timeout)
                 undone.append(rec["step"])
+                _append(journal, {"tx": tx_id, "event": "undone", "step": rec["step"], "by": "recover"})
             except Exception as e:
                 failed.append(rec["step"])
+                _append(journal, {"tx": tx_id, "event": "undo_failed", "step": rec["step"], "error": repr(e)})
                 log(f"recover: undo of {rec['step']} failed: {e!r}")
-        line = json.dumps({"tx": tx_id, "event": "finished", "time": time.time(), "status": "recovered",
-                           "undone": undone, "undo_failed": failed})
-        with open(journal, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+        if not failed:
+            _append(journal, {"tx": tx_id, "event": "finished", "status": "recovered"})
         reports.append({"tx": tx_id, "undone": undone, "undo_failed": failed, "committed": tx["committed"]})
     return reports
+
+
+def _append(journal, record):
+    with open(journal, "a", encoding="utf-8") as f:
+        f.write(json.dumps({**record, "time": time.time()}) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
 
 
 def recover(journal, registry=None, log=print) -> list[dict]:
@@ -976,13 +1045,20 @@ if __name__ == "__main__":
         if x < 0:
             raise ValueError("negative")
 
+    live = {"now": 0, "peak": 0}
+
     @tool(undo=aundo, registry=reg)
     async def reserve(x: int) -> int:
         """Async undoable tool."""
-        await asyncio.sleep(0.2)
-        if x == 99:
-            raise RuntimeError("boom")
-        return x * 2
+        live["now"] += 1
+        live["peak"] = max(live["peak"], live["now"])
+        try:
+            await asyncio.sleep(0.05)
+            if x == 99:
+                raise RuntimeError("boom")
+            return x * 2
+        finally:
+            live["now"] -= 1
 
     @tool(check=acheck, registry=reg)
     async def charge(x: int):
@@ -1001,9 +1077,11 @@ if __name__ == "__main__":
     assert log2 == [("undo", -2)]
 
     wide = [{"id": f"r{i}", "tool": "reserve", "args": {"x": i}} for i in range(4)]
-    start = time.perf_counter()
+    live["peak"] = 0
+    asyncio.run(arun(wide, registry=reg, log=quiet))
+    assert live["peak"] == 1  # sequential by default
     assert asyncio.run(arun(wide, registry=reg, log=quiet, parallel=True)) == {f"r{i}": i * 2 for i in range(4)}
-    assert time.perf_counter() - start < 0.6  # four 0.2s steps overlapped
+    assert live["peak"] == 4  # all four ran at the same time (counted, not timed)
     log2.clear()
     e = expect(PlanFailed, lambda: asyncio.run(arun(wide + [{"id": "bad", "tool": "reserve", "args": {"x": 99}}],
                                                     registry=reg, log=quiet, parallel=True)))
@@ -1118,6 +1196,94 @@ if __name__ == "__main__":
     run(plan(), journal=path, log=quiet)  # a finished run leaves nothing to recover
     assert recover(path, log=quiet) == []
     reset()
+
+    # cancelling a parallel run stops the wave first, so no step finishes after the rollback
+    trail = []
+
+    @tool(undo=lambda r: trail.append(("undo", r)), registry=reg)
+    async def wave_step(n: int):
+        await asyncio.sleep(0 if n == 0 else 0.3)
+        trail.append(("done", n))
+        return n
+
+    async def cancel_midway():
+        task = asyncio.ensure_future(arun([{"id": f"w{i}", "tool": "wave_step", "args": {"n": i}} for i in range(3)],
+                                          registry=reg, log=quiet, parallel=True))
+        await asyncio.sleep(0.1)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        await asyncio.sleep(0.4)  # an orphaned step would finish in this time
+    asyncio.run(cancel_midway())
+    assert trail == [("done", 0), ("undo", 0)]
+
+    # a check only receives the parameters it asks for; UNSET parameters are left out entirely
+    checked = []
+
+    def ref_only(ref):
+        checked.append(ref)
+
+    @tool(check=ref_only, registry=odd)
+    def cancel_with_reason(ref: str, reason: str = "user_request"):
+        pass
+
+    @tool(undo=NOOP, registry=odd)
+    def remote(a: str, b: str = UNSET):
+        got.append(("remote", a, b))
+        return {"a": a}
+
+    shown = []
+    run([{"id": "c", "tool": "cancel_with_reason", "args": {"ref": "R1"}},
+         {"id": "r", "tool": "remote", "args": {"a": "x"}}],
+        registry=odd, confirm=lambda st: shown.extend(st) or True, log=quiet)
+    assert checked == ["R1"] and shown[0]["args"] == {"ref": "R1", "reason": "user_request"}
+    assert got[-1] == ("remote", "x", UNSET) and not UNSET
+    tx = Transaction(registry=odd, log=quiet)
+    tx.call("remote", "y")
+    assert tx.done[-1]["args"] == {"a": "y"}  # not shown, not journaled
+
+    # journal: only the values that can't be serialized are marked
+    assert _jsonable({"a": 1, "o": object, 2: [object]}) == {
+        "a": 1, "o": {_MARK: repr(object)}, "2": [{_MARK: repr(object)}]}
+
+    # recovery journals each undo, so it can be re-run without undoing anything twice
+    path2 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    outage = {"down": True, "calls": []}
+
+    def undo_b(r):
+        outage["calls"].append(r)
+        if outage["down"]:
+            raise ConnectionError("service down")
+
+    @tool(undo=lambda r: outage["calls"].append(r), registry=odd)
+    def part_a():
+        return "a"
+
+    @tool(undo=undo_b, undo_retries=0, registry=odd)
+    def part_b():
+        return "b"
+    tx = Transaction(registry=odd, journal=path2, log=quiet)
+    tx.call("part_a")
+    tx.call("part_b")
+    # ...crash
+    first = recover(path2, registry=odd, log=quiet)
+    assert first[0]["undone"] == ["part_a-1"] and first[0]["undo_failed"] == ["part_b-2"]
+    outage["down"] = False
+    second = recover(path2, registry=odd, log=quiet)
+    assert second[0]["undone"] == ["part_b-2"] and second[0]["undo_failed"] == []
+    assert outage["calls"] == ["b", "a", "b"]  # part_a undone exactly once
+    assert recover(path2, registry=odd, log=quiet) == []
+
+    # an in-process rollback whose undo fails leaves the journal open for recover() to retry
+    outage.update(down=True, calls=[])
+    tx = Transaction(registry=odd, journal=path2, log=quiet)
+    tx.call("part_b")
+    tx.rollback()
+    assert tx.undo_failed == ["part_b-1"]
+    outage["down"] = False
+    assert recover(path2, registry=odd, log=quiet)[0]["undone"] == ["part_b-1"]
 
     # --- tool descriptions for models ---
     class Color(enum.Enum):
