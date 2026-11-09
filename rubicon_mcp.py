@@ -25,21 +25,11 @@ import json
 import keyword
 import typing
 
-from rubicon import NOOP, TOOLS, Tool
+from rubicon import NOOP, TOOLS, UNSET, Tool
 
 __all__ = ["list_all_tools", "register_mcp"]
 
 _PY_TYPES = {"string": str, "integer": int, "number": float, "boolean": bool, "array": list, "object": dict}
-
-
-class _Unset:
-    """Default for optional MCP parameters: left out of the call instead of sent as null."""
-
-    def __repr__(self):
-        return "<unset>"
-
-
-_UNSET = _Unset()
 
 
 def _signature(schema):
@@ -59,7 +49,7 @@ def _signature(schema):
 
     kw = inspect.Parameter.KEYWORD_ONLY
     params = [inspect.Parameter(n, kw, annotation=annotation(n)) for n in props if n in required]
-    params += [inspect.Parameter(n, kw, default=_UNSET, annotation=annotation(n)) for n in props if n not in required]
+    params += [inspect.Parameter(n, kw, default=UNSET, annotation=annotation(n)) for n in props if n not in required]
     if schema.get("additionalProperties", True) is not False:
         extra = next(n for n in ("extra", "extra_args", "_extra") if n not in props)
         params.append(inspect.Parameter(extra, inspect.Parameter.VAR_KEYWORD))
@@ -136,7 +126,7 @@ async def register_mcp(session, *, prefix="", trust_readonly=False, undo=None, c
             for key, value in bound.arguments.items():
                 if sig.parameters[key].kind is inspect.Parameter.VAR_KEYWORD:
                     args.update(value)
-                elif value is not _UNSET:
+                elif value is not UNSET:
                     args[key] = value
             return await call(name, **args)
 
@@ -165,6 +155,8 @@ async def register_mcp(session, *, prefix="", trust_readonly=False, undo=None, c
 
 if __name__ == "__main__":
     import asyncio
+    import os
+    import tempfile
     from types import SimpleNamespace as NS
 
     from mcp.types import ToolAnnotations
@@ -221,6 +213,11 @@ if __name__ == "__main__":
     def tag_of(text: str, tag: str = "default") -> dict:
         return {"tag": tag}
 
+    @srv.tool()
+    def send_note(to: str, cc: str = "nobody") -> str:
+        db["outbox"].append((to, cc))
+        return "sent"
+
     def plan(flight="AI101", to="me@x.com"):  # naive order: cancel first
         return [
             {"id": "cancel", "tool": "cancel_booking", "args": {"ref": "OLD1"}},
@@ -251,12 +248,25 @@ if __name__ == "__main__":
             except ValueError as e:
                 assert "hold_sea" in str(e)
 
-            reg = {}
+            reg, noted = {}, []
             call = await register_mcp(
                 session, registry=reg, trust_readonly=True,
                 # async undo that uses the call's arguments rather than its result
                 undo={"hold_seat": lambda result, args: call("release_seat", flight=args["flight"])},
-                checks={"send_email": valid_to})
+                checks={"send_email": valid_to, "send_note": lambda to: noted.append(to)})
+
+            # Optional MCP parameters left out never leak a sentinel into the check, the
+            # confirmation or the journal.
+            journal = os.path.join(tempfile.mkdtemp(), "j.jsonl")
+            shown = []
+            await arun([{"id": "t", "tool": "tag_of", "args": {"text": "x"}},
+                        {"id": "n", "tool": "send_note", "args": {"to": "a@b"}}], registry=reg, log=quiet,
+                       confirm=lambda st: shown.extend(st) or True, journal=journal)
+            assert noted == ["a@b"] and shown[0]["args"] == {"to": "a@b"}
+            assert db["outbox"].pop() == ("a@b", "nobody")  # server default applied
+            records = [json.loads(line) for line in open(journal)]
+            assert next(r for r in records if r["event"] == "done")["args"] == {"text": "x"}
+            assert "UNSET" not in open(journal).read() and "unserializable" not in open(journal).read()
             assert [s["id"] for s in order(plan(), reg)] == ["find", "hold", "cancel", "mail"]
             spec = {t["name"]: t for t in tools_for_llm(reg)}
             assert spec["hold_seat"]["parameters"]["required"] == ["flight"]
