@@ -24,6 +24,7 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 import os
 import re
 
@@ -94,25 +95,47 @@ def planning_request(goal, registry=None):
     return {"system": SYSTEM, "prompt": f"Tools:\n{tools}\n\nGoal: {goal}", "schema": plan_schema(registry)}
 
 
+_MAX_STARTS = 64  # bracket positions tried when looking for JSON inside prose
+
+
+def _plan_like(value):
+    return (isinstance(value, dict) and "steps" in value) or (
+        isinstance(value, list) and bool(value) and all(isinstance(x, dict) for x in value))
+
+
+def _pick(candidates):
+    """The first candidate that looks like a plan, else the first object or array at all, so
+    a stray "[1]" in the prose before the plan doesn't win."""
+    candidates = list(candidates)
+    return next((c for c in candidates if _plan_like(c)), candidates[0] if candidates else None)
+
+
+def _starts(text):
+    return [i for i, ch in enumerate(text) if ch in "{["][:_MAX_STARTS]
+
+
 def _literal(text):
     """Python-style dict/list output (single quotes, True/None) from models without a JSON mode.
     ast.literal_eval only reads literals; it never runs code."""
-    start = next((i for i, ch in enumerate(text) if ch in "{["), None)
-    if start is None:
-        return None
-    for end in range(len(text), start, -1):
-        if text[end - 1] in "}]":
-            try:
-                value = ast.literal_eval(text[start:end])
-            except (ValueError, SyntaxError, MemoryError, RecursionError, TypeError):
-                continue
-            if isinstance(value, (dict, list)):
-                return value
-    return None
+    ends = [i + 1 for i, ch in enumerate(text) if ch in "}]"][::-1][:_MAX_STARTS]
+
+    def candidates():
+        for start in _starts(text):
+            for end in ends:
+                if end <= start:
+                    break
+                try:
+                    value = ast.literal_eval(text[start:end])
+                except (ValueError, SyntaxError, MemoryError, RecursionError, TypeError):
+                    continue
+                if isinstance(value, (dict, list)):
+                    yield value
+                    break  # the longest literal from this start
+    return _pick(candidates())
 
 
 def _loads(text, repairs=None):
-    """Parse the first JSON object or array in the text, ignoring fences and prose around it.
+    """Parse the JSON object or array in the text, ignoring fences and prose around it.
     With a repairs list, Python-style literals are accepted too (and noted in the list)."""
     t = text.strip()
     try:
@@ -120,17 +143,23 @@ def _loads(text, repairs=None):
     except ValueError:
         pass
     decoder = json.JSONDecoder()
-    for i, ch in enumerate(t):
-        if ch in "{[":
+
+    def candidates():
+        for i in _starts(t):
             try:
-                return decoder.raw_decode(t, i)[0]
+                yield decoder.raw_decode(t, i)[0]
             except ValueError:
                 continue
+    value = _pick(candidates())
+    if value is not None and (_plan_like(value) or repairs is None):
+        return value
     if repairs is not None:
-        value = _literal(t)
-        if value is not None:
+        literal = _literal(t)
+        if literal is not None and (_plan_like(literal) or value is None):
             repairs.append("read Python-style literal output as JSON")
-            return value
+            return literal
+    if value is not None:
+        return value
     raise ValueError(f"model output is not JSON: {text[:200]!r}")
 
 
@@ -154,7 +183,7 @@ def _coerce(value, prop):
     if isinstance(value, str) and value.lstrip().startswith("$"):
         return value
     if kind == "string" and isinstance(value, (int, float)) and not isinstance(value, bool):
-        return str(value)
+        return str(value) if isinstance(value, int) or math.isfinite(value) else value
     if kind == "integer":
         if isinstance(value, str) and _INT.fullmatch(value.strip()):
             return int(value.strip())
@@ -189,14 +218,16 @@ def _repair(plan, tools, repairs):
         if not props:
             continue
         args = step["args"]
-        for key in [k for k in args if k not in props]:
-            fixed = _unique(key, [p for p in props if p not in args])
-            if fixed:
+        free = [p for p in props if p not in args]
+        targets = {k: _unique(k, free) for k in args if k not in props}
+        for key, fixed in targets.items():
+            # two keys aiming at one parameter ("flightNumber" and "flight-number") is ambiguous
+            if fixed and list(targets.values()).count(fixed) == 1:
                 repairs.append(f"step {step['id']!r}: argument {key!r} -> {fixed!r}")
                 args[fixed] = args.pop(key)
         for key, value in list(args.items()):
             new = _coerce(value, props.get(key))
-            if type(new) is not type(value) or new != value:
+            if new is not value:  # _coerce returns the same object when it changes nothing
                 repairs.append(f"step {step['id']!r}: {key}={value!r} -> {new!r}")
                 args[key] = new
 
@@ -213,14 +244,15 @@ def parse_plan(text, registry=None, *, repair=True, repairs=None):
     """
     changes = [] if repair else None
     try:
-        return _parse_plan(text, registry, changes)
+        plan = _parse_plan(text, registry, changes)
     except ValueError as e:  # includes json.JSONDecodeError
         raise PlanRejected(str(e), text) from e
     finally:
-        for change in changes or []:
-            _logger.info("repaired plan: %s", change)
         if repairs is not None:
             repairs.extend(changes or [])
+    for change in changes or []:  # logged only for plans that were accepted
+        _logger.info("repaired plan: %s", change)
+    return plan
 
 
 def _parse_plan(text, registry, repairs):
@@ -249,8 +281,9 @@ def _parse_plan(text, registry, repairs):
                     pass
         elif isinstance(raw, dict):
             args = raw
+        after = s.get("after")
         plan.append({"id": s.get("id"), "tool": s.get("tool"),
-                     "args": {} if args is None else args, "after": s.get("after") or []})
+                     "args": {} if args is None else args, "after": [] if after is None else after})
     if repairs is not None:
         _repair(plan, _registry(registry), repairs)
     order(plan, registry)  # full validation before anything can run
@@ -612,6 +645,53 @@ if __name__ == "__main__":
         calls.append(goal)
         return parse_plan(json.dumps([{"id": "b", "tool": "BOOK", "args": {"FlightNumber": 7, "seats": "1"}}]), registry)
     assert agent("book", planner=sloppy, registry=rep, confirm=lambda st: True) == {"b": "7"} and len(calls) == 1
+
+    # Bracketed prose before the plan doesn't hijack parsing (JSON or Python-style).
+    good = [{"id": "b", "tool": "book", "args": {"flight_number": "X", "seats": 1}}]
+    assert parse_plan("See note [1] below:\n```json\n" + json.dumps(good) + "\n```", rep)[0]["id"] == "b"
+    assert parse_plan("Option {2} is best: " + json.dumps({"steps": good}), rep)[0]["id"] == "b"
+    assert parse_plan("Step [1]:\n" + repr(good).replace('"', "'"), rep)[0]["id"] == "b"
+
+    # Two keys aiming at one parameter are ambiguous: neither is renamed.
+    @tool(undo=NOOP, registry=rep)
+    def flex(flight_number: str = "", **extra):
+        return flight_number
+    fixes = []
+    both = parse_plan(json.dumps([{"id": "f", "tool": "flex", "args": {"flightNumber": "A", "flight-number": "B"}}]),
+                      rep, repairs=fixes)
+    assert both[0]["args"] == {"flightNumber": "A", "flight-number": "B"} and fixes == []
+
+    # NaN never produces a bogus repair, and isn't turned into the string "nan".
+    fixes = []
+    nan_plan = parse_plan('[{"id": "b", "tool": "book", "args": {"flight_number": NaN, "seats": 1, "price": NaN}}]',
+                          rep, repairs=fixes)
+    assert fixes == [] and math.isnan(nan_plan[0]["args"]["flight_number"])
+
+    # "after" must be a list; only null means "none", even in strict mode.
+    for bad_after in ('""', "0", "{}"):
+        expect(PlanRejected, parse_plan, f'[{{"id": "b", "tool": "book", "args": {{"flight_number": "X", "seats": 1}}, '
+               f'"after": {bad_after}}}]', rep, repair=False)
+    assert parse_plan('[{"id": "b", "tool": "book", "args": {"flight_number": "X", "seats": 1}, "after": null}]',
+                      rep, repair=False)[0]["after"] == []
+
+    # Repairs are logged only for plans that are accepted.
+    logged = []
+
+    class Grab(logging.Handler):
+        def emit(self, record):
+            logged.append(record.getMessage())
+    grab = Grab(logging.INFO)
+    _logger.addHandler(grab)
+    old_level = _logger.level
+    _logger.setLevel(logging.INFO)  # setLevel, not .level =, so the logger's cache is cleared
+    try:
+        expect(PlanRejected, parse_plan, json.dumps([{"id": "b", "tool": "Book", "args": {"seats": "2"}}]), rep)
+        assert logged == []  # partly repaired, still rejected (flight_number missing): nothing logged
+        parse_plan(json.dumps([{"id": "b", "tool": "Book", "args": {"flight_number": "X", "seats": "2"}}]), rep)
+        assert len(logged) == 2 and all("repaired plan" in m for m in logged)
+    finally:
+        _logger.removeHandler(grab)
+        _logger.setLevel(old_level)
 
     # Empty responses are clear errors, not StopIteration / IndexError.
     no_text = NS(stop_reason="end_turn", content=[NS(type="thinking")])
