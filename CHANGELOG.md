@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.6.0
+
+### Fixed
+- `recover()` undid steps that a commit had made final. A `commit()` with no permanent steps
+  waiting wrote "finished" without a "committed" record, so recovery still saw the earlier
+  undoable steps as open. "finished" now settles everything before it.
+- `recover()` skipped a `Transaction` that committed in stages and crashed in a later stage, so
+  the later stage was never undone. New activity now reopens the transaction.
+- A crash while a permanent step was running could make `recover()` undo the steps that step
+  relied on, the same "no flight at all" outcome as the 0.4.0 fix, but after a crash. Steps are
+  now journaled as "started" before they run; recovery leaves such a transaction untouched and
+  reports it in `needs_attention` (with `kept`), and reports half-run undoable steps in
+  `uncertain`.
+- A step cancelled from inside (for example by a library's cancel scope) during a parallel wave
+  was treated as finished. It is now a step failure and everything is rolled back.
+- MCP schemas without `additionalProperties` accepted unknown arguments, so a hallucinated
+  argument could pass validation and be silently ignored by the server. Extras are now accepted
+  only when the schema allows them explicitly or declares no properties.
+- A sync tool with `retries`, called with `tx.call()` from inside a running event loop, failed on
+  its first retry because the backoff used `asyncio.sleep`. Sync tools now wait synchronously.
+- An exception in an `on_event` or `log` callback turned a successful step into a failure after
+  the tool had run. Callback errors are now written to stderr and execution carries on.
+- `GEMINI_MODEL` and `CLAUDE_MODEL` set after importing `rubicon_llm` (for example by
+  `load_dotenv()`) were ignored. They are now read each time a planner runs.
+- `list_all_tools()` failed on session objects whose signature can't be inspected.
+- The MCP self-check left two files open and read them with the platform encoding.
+
 ## 0.5.0
 
 ### Fixed

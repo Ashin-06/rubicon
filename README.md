@@ -216,7 +216,7 @@ References:
     retries=0,          # extra attempts for the tool itself; only for tools safe to repeat
     undo_retries=2,     # extra attempts for undo, with backoff (default 2)
     timeout=30,         # seconds per attempt, for async functions
-)
+)  # a sync tool waits between retries synchronously; an async one with asyncio.sleep
 def put_file(path: str, content: str) -> str: ...
 
 def preview_cancel(ref):
@@ -262,6 +262,9 @@ async def main(session):                      # mcp ClientSession (1.x or 2.x) o
 - Each tool gets a real Python signature from its input schema (keyword-only, with type
   annotations), so frameworks that inspect signatures see the actual parameters. Optional
   parameters you leave out are not sent, so the server's own defaults apply.
+- Arguments the schema doesn't declare are rejected before anything runs, unless the schema sets
+  `additionalProperties` to `true` (or to a schema) or declares no properties at all. Many servers
+  silently ignore unknown arguments, so a hallucinated one would otherwise go unnoticed.
 - Names in `undo` and `checks` must exist on the server; a typo raises an error.
 - Tool lists are fetched across all pages. `prefix=` namespaces tools (including their function
   names) when you register several servers.
@@ -288,7 +291,8 @@ agent("...", planner=partial(plan_with_openai, model="llama3.3",          # Olla
 | `plan_with_openai` | `openai` | `OPENAI_API_KEY` (not needed for local servers) | none, pass `model=` |
 
 - Override the default models with `GEMINI_MODEL` and `CLAUDE_MODEL` (environment or `.env`), or
-  pass `model=`.
+  pass `model=`. The variables are read each time a planner runs, so loading a `.env` after
+  importing works too.
 - If a plan is rejected (bad JSON, unknown tool, wrong argument names, bad ids), `agent()` sends
   the model its previous plan and the error, and asks for a corrected plan. `attempts=2` by
   default. A final rejection raises `PlanRejected`, a `ValueError` whose `text` is what the model
@@ -331,7 +335,8 @@ recover("rubicon.jsonl")            # after a restart: undo what a crash left ha
 - `on_event` receives dicts such as `{"event": "step_done", "step": "hold", "tool": "hold_seat",
   "duration_ms": 12.3, "tx": "...", "time": ...}`. Events: `step_started`, `step_done`,
   `check_passed`, `gate_confirmed`, `gate_declined`, `step_committed`, `step_undone`,
-  `undo_failed`. Forward them to your logger or tracing system.
+  `undo_failed`. Forward them to your logger or tracing system. If your `on_event` or `log`
+  callback raises, the error is written to stderr and execution carries on unchanged.
 - `journal=` appends one JSON line per step (flushed to disk) with the arguments and result
   needed to undo it. If the process is killed, `recover()` undoes the steps of every unfinished
   transaction since its last commit, using the same tools.
@@ -342,6 +347,16 @@ recover("rubicon.jsonl")            # after a restart: undo what a crash left ha
   undo failed.
 - Values that aren't JSON-serializable are marked individually in the journal. A step whose
   undo would need such a value is reported in `undo_failed` instead of being replayed wrongly.
+- Every step is journaled as "started" before it runs. If the crash happened while a permanent
+  step was running, nobody knows whether it went through, so `recover()` undoes nothing for that
+  transaction: undoing what it relied on could leave things worse. It reports the step in
+  `needs_attention` and the steps it kept in `kept`, for a person to check. An undoable step that
+  started but never reported a result is listed in `uncertain`.
+- A `Transaction` that commits in stages is covered too: a crash in a later stage undoes only
+  that stage.
+
+Each report is `{"tx", "undone", "undo_failed", "committed", "uncertain", "needs_attention",
+"kept"}`.
 
 ## Async
 
@@ -395,7 +410,7 @@ OPENAI_MODEL=llama3.3 OPENAI_BASE_URL=http://localhost:11434/v1 python demo.py o
 | `NOOP` | Undo function for read-only tools. |
 | `run(plan, registry=None, confirm=None, log=print, *, parallel=False, on_event=None, journal=None)`, `arun(...)` | Run a plan and return `{step_id: result}`. |
 | `Transaction(registry=None, confirm=None, log=print, *, on_event=None, journal=None)` | Guard an agent loop. Methods: `call`/`acall`, `commit`/`acommit`, `rollback`/`arollback`, `wrap(name)`, `wrap_all()`. Attributes: `results`, `committed`, `undone`, `undo_failed`. Works as a sync or async context manager. |
-| `recover(journal, registry=None, log=print)`, `arecover(...)` | Undo transactions a crash left unfinished. Returns one report per transaction. |
+| `recover(journal, registry=None, log=print)`, `arecover(...)` | Undo transactions a crash left unfinished. Returns one report per transaction (see [crash recovery](#parallel-steps-events-and-crash-recovery)). Safe to run repeatedly. |
 | `order(plan, registry=None)` | Validate a plan and return the order it would run in. |
 | `tools_for_llm(registry=None)` | Tools as `{name, description, reversible, parameters}`, with JSON Schema parameters. |
 | `PlanFailed` | Raised after rollback. Attributes: `step`, `cause`, `undone`, `committed`, `not_run`, `undo_failed`, `results`. |
