@@ -122,8 +122,10 @@ class World:
 class CrashJournal:
     """An in-memory journal whose process dies after a chosen number of writes."""
 
-    def __init__(self, world, writes_until_crash):
+    def __init__(self, world, writes_until_crash, die_in_permanent=0.0):
         self.world, self.rows, self.left = world, [], writes_until_crash
+        self.die_in_permanent = die_in_permanent  # chance to die right after a permanent step starts
+        self.rng = random.Random(writes_until_crash)
 
     def append(self, records):
         if self.world.dead:
@@ -133,6 +135,9 @@ class CrashJournal:
             raise Died()
         self.left -= 1
         self.rows.extend(dict(r) for r in records)
+        if (any(r.get("event") == "started" and r.get("permanent") for r in records)
+                and self.rng.random() < self.die_in_permanent):
+            self.left = 0  # the next write (the step's outcome) never happens
 
     def records(self):
         return list(self.rows)
@@ -247,7 +252,9 @@ def operator(journal, world, key_of=lambda step: step):
                 acknowledge(journal, tx, note="it went through; keep everything")
             else:
                 acknowledge(journal, tx, step, note="it never happened; undo the rest")
-        else:  # uncertain or undo_failed: undo by hand if it is in place
+        elif kind == "undo_failed" and key in world.fail_undo:
+            continue  # the outage is still on: leave it for recover() to retry once it ends
+        else:  # uncertain, or an undo that keeps failing: undo by hand if it is in place
             world.items.discard(key)
             acknowledge(journal, tx, step, note="handled by hand")
 
@@ -257,7 +264,7 @@ def scenario_crash(rng):
     reg = world.registry()
     plan = make_plan(rng)
     inject(rng, world, plan)
-    journal = CrashJournal(world, writes_until_crash=rng.randint(0, 30))
+    journal = CrashJournal(world, writes_until_crash=rng.randint(0, 30), die_in_permanent=0.3)
     completed = False
     try:
         execute(rng, plan, reg, journal=journal)
@@ -342,10 +349,12 @@ def scenario_transaction(rng):
     """An agent loop through Transaction: calls, staged commits, agent crashes, process deaths."""
     world = World()
     reg = world.registry()
-    journal = CrashJournal(world, writes_until_crash=rng.randint(0, 40))
+    harsh = rng.random() < 0.4  # many declines, undo outages and deaths inside permanent steps
+    journal = CrashJournal(world, writes_until_crash=rng.randint(0, 40),
+                           die_in_permanent=0.6 if harsh else 0.2)
     completed, labels = False, {}
     tx = Transaction(registry=reg, journal=journal, log=lambda m: None,
-                     confirm=lambda steps: rng.random() > 0.15)
+                     confirm=lambda steps: rng.random() > (0.5 if harsh else 0.15))
     try:
         with tx:
             for i in range(rng.randint(1, 8)):
@@ -355,15 +364,18 @@ def scenario_transaction(rng):
                     world.fail_tool.add(key)
                 if rng.random() < 0.1:
                     world.fail_check.add(key)
-                if rng.random() < 0.15:
+                if rng.random() < (0.4 if harsh else 0.15):
                     world.fail_undo.add(key)
                 try:
                     tx.call(name, key)
                 except Boom:
                     pass  # the agent sees the tool error and carries on
                 if rng.random() < 0.2:
-                    tx.commit()
-                    world.make_final()
+                    try:
+                        tx.commit()
+                        world.make_final()
+                    except PlanFailed:
+                        pass  # declined or failed: rolled back, and the agent carries on
                 if rng.random() < 0.08:
                     raise Boom("the agent crashed")
         completed = True
@@ -387,7 +399,7 @@ class OtherProcess:
 
     def records(self):
         alive = os.getppid() if hasattr(os, "getppid") else 1
-        return [{**r, "pid": alive} if r.get("event") == "begin" else r for r in self.journal.records()]
+        return [{**r, "pid": alive} if "pid" in r else r for r in self.journal.records()]
 
     def drop(self, tx_ids):
         self.journal.drop(tx_ids)
@@ -419,11 +431,13 @@ def scenario_maintenance(rng):
     acknowledge() on the same journal while the transaction is still running."""
     world = World()
     reg = world.registry()
-    journal = CrashJournal(world, writes_until_crash=rng.randint(0, 60) if rng.random() < 0.5 else -1)
+    harsh = rng.random() < 0.4
+    journal = CrashJournal(world, writes_until_crash=rng.randint(0, 60) if rng.random() < 0.5 else -1,
+                           die_in_permanent=0.6 if harsh else 0.2)
     other = OtherProcess(journal, world)
     completed, labels = False, {}
     tx = Transaction(registry=reg, journal=journal, log=lambda m: None,
-                     confirm=lambda steps: rng.random() > 0.15)
+                     confirm=lambda steps: rng.random() > (0.5 if harsh else 0.15))
     try:
         with tx:
             for i in range(rng.randint(1, 8)):
@@ -431,7 +445,7 @@ def scenario_maintenance(rng):
                 labels[f"{name}-{i + 1}"] = key
                 if rng.random() < 0.1:
                     world.fail_tool.add(key)
-                if rng.random() < 0.15:
+                if rng.random() < (0.4 if harsh else 0.15):
                     world.fail_undo.add(key)
                 try:
                     tx.call(name, key)
