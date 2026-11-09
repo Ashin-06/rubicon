@@ -45,6 +45,12 @@ class World:
         self.violations = []
         self.dead = False
         self.fail_tool, self.fail_check, self.fail_undo = set(), set(), set()
+        self.maintenance = False  # True while "another process" runs recover/compact/acknowledge
+        self.owed = set()  # keys whose in-process undo was attempted and failed
+        self.finals = set()  # effects made final: in place when a commit returned or a permanent step happened
+
+    def make_final(self):
+        self.finals |= self.items - self.owed
 
     def registry(self):
         reg = {}
@@ -65,7 +71,11 @@ class World:
             if self.dead:
                 raise Died()
             key = result["key"]
+            if self.maintenance and key not in self.owed:
+                self.violations.append(f"another process undid {key} while its transaction was running")
             if key in self.fail_undo:
+                if not self.maintenance:
+                    self.owed.add(key)
                 raise Boom(f"undo of {key} failed")
             if key not in self.ever:
                 self.violations.append(f"undo of {key}, which never happened")
@@ -79,6 +89,7 @@ class World:
             if any(k == key for kind, k in self.timeline if kind == "p"):
                 self.violations.append(f"permanent {key} ran twice")
             self.timeline.append(("p", key))
+            self.make_final()  # what is in place now is relied on by a permanent step
             return "ok"
 
         def check(key):
@@ -305,16 +316,16 @@ def recover_until_clean(rng, journal, world, reg, key_of=lambda step: step):
             journal.restart()
 
 
-def final_state_problems(world, journal, reg, final_upto):
-    """Effects before `final_upto` (a commit that returned, or a permanent step that happened)
-    must stay; effects after it must be cleaned up; nothing may be left open."""
+def final_state_problems(world, journal, reg):
+    """Final effects (in place when a commit returned or a permanent step happened) must stay;
+    every other effect must be cleaned up; nothing may be left open."""
     problems = list(world.violations)
-    for i, (kind, key) in enumerate(world.timeline):
+    for kind, key in world.timeline:
         if kind != "u":
             continue
-        if i < final_upto and key not in world.items:
+        if key in world.finals and key not in world.items:
             problems.append(f"{key} was undone although it was final")
-        if i >= final_upto and key in world.items:
+        if key not in world.finals and key in world.items:
             problems.append(f"{key} was never cleaned up")
     if dead_letters(journal):
         problems.append(f"dead letters left: {dead_letters(journal)}")
@@ -332,7 +343,7 @@ def scenario_transaction(rng):
     world = World()
     reg = world.registry()
     journal = CrashJournal(world, writes_until_crash=rng.randint(0, 40))
-    final_upto, completed, labels = 0, False, {}
+    completed, labels = False, {}
     tx = Transaction(registry=reg, journal=journal, log=lambda m: None,
                      confirm=lambda steps: rng.random() > 0.15)
     try:
@@ -352,17 +363,97 @@ def scenario_transaction(rng):
                     pass  # the agent sees the tool error and carries on
                 if rng.random() < 0.2:
                     tx.commit()
-                    final_upto = len(world.timeline)
+                    world.make_final()
                 if rng.random() < 0.08:
                     raise Boom("the agent crashed")
         completed = True
     except (PlanFailed, Boom, Died):
         pass
     if completed:
-        final_upto = len(world.timeline)
-    final_upto = max(final_upto, world.last_permanent())
+        world.make_final()
     recover_until_clean(rng, journal, world, reg, key_of=labels.get)
-    return final_state_problems(world, journal, reg, final_upto)
+    return final_state_problems(world, journal, reg)
+
+
+class OtherProcess:
+    """The same journal seen from another worker process: this process looks alive to it (its
+    pid is swapped for a live one) and nothing here is in its in-memory live set."""
+
+    def __init__(self, journal, world):
+        self.journal, self.world = journal, world
+
+    def append(self, records):
+        self.journal.append(records)
+
+    def records(self):
+        alive = os.getppid() if hasattr(os, "getppid") else 1
+        return [{**r, "pid": alive} if r.get("event") == "begin" else r for r in self.journal.records()]
+
+    def drop(self, tx_ids):
+        self.journal.drop(tx_ids)
+
+    def maintain(self, rng, reg, key_of):
+        hidden = set(_LIVE)
+        _LIVE.clear()
+        self.world.maintenance = True
+        try:
+            if rng.random() < 0.6:
+                recover(self, registry=reg, log=lambda m: None)
+            if rng.random() < 0.4:
+                compact(self)
+            for letter in dead_letters(self):
+                if letter["kind"] != "undo_failed":
+                    self.world.violations.append(f"another process treated a running transaction as "
+                                                 f"crashed: {letter}")
+                elif rng.random() < 0.5:  # a person fixes a failed undo by hand
+                    self.world.items.discard(key_of(letter["step"]))
+                    self.world.owed.discard(key_of(letter["step"]))
+                    acknowledge(self, letter["tx"], letter["step"], note="handled by hand")
+        finally:
+            self.world.maintenance = False
+            _LIVE.update(hidden)
+
+
+def scenario_maintenance(rng):
+    """Like scenario_transaction, with another worker running recover(), compact() and
+    acknowledge() on the same journal while the transaction is still running."""
+    world = World()
+    reg = world.registry()
+    journal = CrashJournal(world, writes_until_crash=rng.randint(0, 60) if rng.random() < 0.5 else -1)
+    other = OtherProcess(journal, world)
+    completed, labels = False, {}
+    tx = Transaction(registry=reg, journal=journal, log=lambda m: None,
+                     confirm=lambda steps: rng.random() > 0.15)
+    try:
+        with tx:
+            for i in range(rng.randint(1, 8)):
+                key, name = f"t{i}", rng.choice(UNDOABLE + PERMANENT)
+                labels[f"{name}-{i + 1}"] = key
+                if rng.random() < 0.1:
+                    world.fail_tool.add(key)
+                if rng.random() < 0.15:
+                    world.fail_undo.add(key)
+                try:
+                    tx.call(name, key)
+                except Boom:
+                    pass
+                if rng.random() < 0.25:
+                    try:
+                        tx.commit()
+                        world.make_final()
+                    except PlanFailed:
+                        pass  # declined or failed: rolled back, and the agent carries on
+                if rng.random() < 0.6:
+                    other.maintain(rng, reg, labels.get)
+                if rng.random() < 0.05:
+                    raise Boom("the agent crashed")
+        completed = True
+    except (PlanFailed, Boom, Died):
+        pass
+    if completed:
+        world.make_final()
+    recover_until_clean(rng, journal, world, reg, key_of=labels.get)
+    return final_state_problems(world, journal, reg)
 
 
 def _sweep(scenario, offset):
@@ -389,8 +480,14 @@ def test_transaction_invariants():
     _sweep(scenario_transaction, 2_000_000)
 
 
+def test_concurrent_maintenance_invariants():
+    _sweep(scenario_maintenance, 3_000_000)
+
+
 if __name__ == "__main__":
     test_in_process_invariants()
     test_crash_and_recovery_invariants()
     test_transaction_invariants()
-    print(f"fuzz: {COUNT} scenarios each of plans, crash recovery and agent transactions passed")
+    test_concurrent_maintenance_invariants()
+    print(f"fuzz: {COUNT} scenarios each of plans, crash recovery, agent transactions and "
+          f"concurrent maintenance passed")
