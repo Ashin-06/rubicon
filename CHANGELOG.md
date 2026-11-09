@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.3
+
+### Changed
+- `plan_with_gemini` caps the answer at 16,000 output tokens, as `plan_with_claude` already
+  did, so a runaway response can't run up cost. A plan is far smaller; a cut-off one is
+  rejected and retried.
+- Every intentionally ignored exception now says why in a comment.
+
+Both came from scanning Rubicon with vibeaudit (0 critical, 0 high; the one remaining medium
+finding is a false alarm in vibeaudit: only "?" placeholders are formatted into the SQL in
+`SQLiteJournal.drop()`).
+
 ## 0.8.2
 
 ### Fixed
