@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import re
+import socket
 import threading
 import time
 import types
@@ -312,6 +313,36 @@ async def _call(fn, *args, **kwargs):
 
 _DRIVING = contextvars.ContextVar("rubicon_driving", default=False)
 
+_HOST = socket.gethostname()
+_LIVE: set = set()  # ids of journaled transactions in this process that have steps not yet settled
+
+
+def _pid_alive(pid) -> bool:
+    """Whether a process with this id exists on this machine. Errs towards "alive" when unsure,
+    because treating a live transaction as crashed would undo work that is still in use."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.get_last_error() == 5  # access denied: it exists
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
 
 async def _attempt(fn, args, kwargs, retries, timeout):
     """Call with optional timeout (async only) and retries with exponential backoff."""
@@ -491,7 +522,7 @@ class Transaction:
         self.committed, self.results = [], {}
         self.undone, self.undo_failed = [], []
         self._journal, self._lock, self._counter = _as_journal(journal), threading.Lock(), 0
-        self._began = False
+        self._began = self._dirty = False
 
     # -- bookkeeping
 
@@ -516,13 +547,22 @@ class Transaction:
         with self._lock:
             if not self._began:
                 self._began = True
-                records.insert(0, {"tx": self.id, "event": "begin", "time": now})
+                # who runs this transaction, so recover() elsewhere can tell it's still alive
+                records.insert(0, {"tx": self.id, "event": "begin", "time": now, "pid": os.getpid(),
+                                   "host": _HOST})
+            if event in ("started", "done", "committed"):
+                self._dirty = True
+                _LIVE.add(self.id)
             self._journal.append(records)
 
     def _settle(self, status):
         """Journal that everything so far is committed or undone. While an earlier undo is still
-        owed (tx.undo_failed), write "settled" instead of "finished" so recover() retries it."""
-        self._write("finished" if not self.undo_failed else "settled", status=status)
+        owed (tx.undo_failed), write "settled" instead of "finished" so recover() retries it.
+        Writes nothing if no step ran since the last settle (no empty or duplicate records)."""
+        _LIVE.discard(self.id)
+        if self._dirty:
+            self._write("finished" if not self.undo_failed else "settled", status=status)
+            self._dirty = False
 
     def _label(self, name):
         with self._lock:
@@ -877,6 +917,12 @@ class FileJournal:
                 os.fsync(f.fileno())
 
     def records(self):
+        # read under the write lock: never half of a line being written, and on Windows the file
+        # is never open here while drop() replaces it
+        with _FileLock(self.path + ".write.lock", blocking=True):
+            return self._read()
+
+    def _read(self):
         if not os.path.exists(self.path):
             return []
         out = []
@@ -896,7 +942,7 @@ class FileJournal:
         """Remove every record of these transactions (atomic rename; writers wait meanwhile)."""
         tx_ids = set(tx_ids)
         with _FileLock(self.path + ".write.lock", blocking=True):
-            keep = [r for r in self.records() if r.get("tx") not in tx_ids]
+            keep = [r for r in self._read() if r.get("tx") not in tx_ids]
             tmp = self.path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 f.write("".join(json.dumps(r, default=repr) + "\n" for r in keep))
@@ -951,9 +997,15 @@ class SQLiteJournal:
     def drop(self, tx_ids):
         tx_ids = list(tx_ids)
         with self._connect() as db:
-            for i in range(0, len(tx_ids), 500):
-                chunk = tx_ids[i:i + 500]
-                db.execute(f"DELETE FROM rubicon_journal WHERE tx IN ({','.join('?' * len(chunk))})", chunk)
+            db.execute("BEGIN IMMEDIATE")  # all chunks or none
+            try:
+                for i in range(0, len(tx_ids), 500):
+                    chunk = tx_ids[i:i + 500]
+                    db.execute(f"DELETE FROM rubicon_journal WHERE tx IN ({','.join('?' * len(chunk))})", chunk)
+                db.execute("COMMIT")
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
 
 
 def _as_journal(journal):
@@ -987,10 +1039,14 @@ def _replay(records):
         if not tx_id or not event:
             continue
         rec = {**rec, "_pos": position}
-        tx = txs.setdefault(tx_id, {"done": {}, "owed": {}, "committed": [], "open": {}, "finished": False})
+        tx = txs.setdefault(tx_id, {"done": {}, "owed": {}, "committed": [], "open": {}, "finished": False,
+                                    "settled": False, "begin": None})
         if event in ("started", "done", "committed"):
-            tx["finished"] = False  # new activity reopens a transaction that committed in stages
-        if event == "started":
+            # new activity reopens a transaction that committed in stages
+            tx["finished"] = tx["settled"] = False
+        if event == "begin":
+            tx["begin"] = rec
+        elif event == "started":
             tx["open"][step] = rec
         elif event == "done":
             tx["open"].pop(step, None)
@@ -1009,6 +1065,8 @@ def _replay(records):
         elif event == "dead_letter":
             letters[(tx_id, step)] = {"tx": tx_id, "step": step, "kind": rec.get("kind"),
                                       "reason": rec.get("reason"), "time": rec.get("time")}
+            if rec.get("kind") == "uncertain":  # reported; nothing more recover() can do about it
+                tx["open"].pop(step, None)
         elif event == "undone":
             tx["done"].pop(step, None)
             tx["owed"].pop(step, None)
@@ -1028,14 +1086,30 @@ def _replay(records):
             tx["done"].clear()
             tx["open"].clear()
             tx["finished"] = event == "finished"
+            tx["settled"] = True
+    for tx in txs.values():  # settled, and a person resolved whatever was still owed
+        if tx["settled"] and not (tx["open"] or tx["done"] or tx["owed"]):
+            tx["finished"] = True
     return txs, letters
+
+
+def _maybe_running(tx) -> bool:
+    """Whether a transaction may still be running, so recover() must leave it alone."""
+    begin = tx["begin"]
+    if not begin or "pid" not in begin:
+        return False  # written before liveness was recorded
+    if begin.get("host") != _HOST:
+        return True  # another machine: can't check, so don't assume it died
+    if begin["pid"] == os.getpid():
+        return begin["tx"] in _LIVE
+    return _pid_alive(begin["pid"])
 
 
 def _record(event, tx, **data):
     return {"tx": tx, "event": event, "time": time.time(), **data}
 
 
-async def arecover(journal, registry=None, log=None, *, on_dead_letter=None) -> list[dict]:
+async def arecover(journal, registry=None, log=None, *, on_dead_letter=None, include_live=False) -> list[dict]:
     """Undo transactions that a crash left unfinished, using their journal.
 
     For each unfinished transaction, undoable steps completed after its last commit are undone in
@@ -1053,6 +1127,11 @@ async def arecover(journal, registry=None, log=None, *, on_dead_letter=None) -> 
     dead_letters() until acknowledge() resolves it, and is passed once to on_dead_letter(dict).
     Only one recover() runs per journal at a time; another one raises JournalBusy.
 
+    Transactions that may still be running are left alone: their process is alive on this
+    machine, or they belong to another machine (which can't be checked from here). So recover()
+    is safe to run while other workers use the same journal. Run it on each machine, or pass
+    include_live=True when you know those processes are gone.
+
     Returns one report per transaction:
     {"tx", "undone", "undo_failed", "committed", "uncertain", "needs_attention", "kept"}.
     """
@@ -1064,6 +1143,10 @@ async def arecover(journal, registry=None, log=None, *, on_dead_letter=None) -> 
         reports = []
         for tx_id, tx in txs.items():
             if tx["finished"] and not tx["owed"]:
+                continue
+            if not include_live and _maybe_running(tx):
+                _logger.info("recover: skipping transaction %s; it may still be running (pid %s on %s)",
+                             tx_id, tx["begin"].get("pid"), tx["begin"].get("host"))
                 continue
 
             def dead_letter(step, kind, reason, write=True):
@@ -1128,9 +1211,9 @@ async def arecover(journal, registry=None, log=None, *, on_dead_letter=None) -> 
         return reports
 
 
-def recover(journal, registry=None, log=None, *, on_dead_letter=None) -> list[dict]:
+def recover(journal, registry=None, log=None, *, on_dead_letter=None, include_live=False) -> list[dict]:
     """Sync version of arecover()."""
-    return _sync(arecover(journal, registry, log, on_dead_letter=on_dead_letter))
+    return _sync(arecover(journal, registry, log, on_dead_letter=on_dead_letter, include_live=include_live))
 
 
 def dead_letters(journal) -> list[dict]:
@@ -1148,9 +1231,16 @@ def acknowledge(journal, tx, step=None, note=""):
     """Record that a person handled a dead letter, so recover() and dead_letters() stop reporting it.
 
     With a step: that step is settled as it is (Rubicon won't undo it). Without a step: the whole
-    transaction is settled, including any steps recover() was keeping.
+    transaction is settled, including any steps recover() was keeping. Raises ValueError for a
+    transaction or step the journal doesn't contain, so a typo can't leave a dead letter open.
     """
-    _as_journal(journal).append([_record("resolved", tx, step=step, note=note)])
+    j = _as_journal(journal)
+    records = [r for r in j.records() if r.get("tx") == tx]
+    if not records:
+        raise ValueError(f"no transaction {tx!r} in {j!r}")
+    if step is not None and not any(r.get("step") == step for r in records):
+        raise ValueError(f"transaction {tx!r} has no step {step!r}")
+    j.append([_record("resolved", tx, step=step, note=note)])
 
 
 def compact(journal) -> int:
@@ -1178,6 +1268,10 @@ if __name__ == "__main__":
     import functools
     import sys
     import tempfile
+
+    def crashed(tx):
+        """Simulate the process dying: the transaction stops being live in this process."""
+        _LIVE.discard(tx.id)
 
     @contextlib.contextmanager
     def captured_warnings():
@@ -1535,7 +1629,7 @@ if __name__ == "__main__":
     tx = Transaction(journal=path, log=quiet)
     tx.call("book_flight", flight="AI101")
     tx.call("search", route="x")
-    # ...the process dies here: no rollback, no commit
+    crashed(tx)  # the process dies here: no rollback, no commit
     assert db["holds"] == ["AI101"]
     report = recover(path, log=quiet)
     assert report[0]["undone"] == ["search-2", "book_flight-1"] and clean()
@@ -1614,7 +1708,7 @@ if __name__ == "__main__":
     tx = Transaction(registry=odd, journal=path2, log=quiet)
     tx.call("part_a")
     tx.call("part_b")
-    # ...crash
+    crashed(tx)
     first = recover(path2, registry=odd, log=quiet)
     assert first[0]["undone"] == ["part_a-1"] and first[0]["undo_failed"] == ["part_b-2"]
     outage["down"] = False
@@ -1638,7 +1732,8 @@ if __name__ == "__main__":
     tx = Transaction(registry=odd, journal=path3, log=quiet)
     tx.call("part_a")
     tx.commit()  # stage 1 done: part_a is final
-    tx.call("part_b")  # stage 2... crash
+    tx.call("part_b")  # stage 2...
+    crashed(tx)
     staged = recover(path3, registry=odd, log=quiet)
     assert staged[0]["undone"] == ["part_b-2"] and outage["calls"] == ["b"]
 
@@ -1796,7 +1891,8 @@ if __name__ == "__main__":
         tx = Transaction(registry=odd, journal=journal, log=quiet)
         tx.call("part_a")
         tx.call("make_hold")
-        return tx.id  # ...the process dies here
+        crashed(tx)
+        return tx.id
 
     outage.update(down=False, calls=[])
     db_path = os.path.join(tempfile.mkdtemp(), "rubicon.db")
@@ -1903,6 +1999,99 @@ if __name__ == "__main__":
         reps = {r["tx"]: r for r in recover(journal, registry=odd, log=quiet)}
         assert reps[stuck.id]["undone"] == ["take-1"] and reps[open_tx]["undone"] == ["make_hold-2", "part_a-1"]
         assert compact(journal) == 2 and journal.records() == []
+
+    # --- recover() never touches a transaction that may still be running ---
+    path12 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    outage.update(down=False, calls=[])
+    live_tx = Transaction(registry=odd, journal=path12, log=quiet)
+    live_tx.call("part_a")  # still running in this process
+    assert recover(path12, registry=odd, log=quiet) == [] and outage["calls"] == []
+    crashed(live_tx)
+    assert recover(path12, registry=odd, log=quiet)[0]["undone"] == ["part_a-1"]
+
+    # ...in another process that is alive, then killed
+    path13 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    child = (f"import sys, time; sys.path.insert(0, {here!r})\n"
+             "from rubicon import Transaction, tool, NOOP\n"
+             "reg = {}\n"
+             "tool(lambda: 'a', name='part_a', undo=NOOP, registry=reg)\n"
+             f"tx = Transaction(registry=reg, journal={path13!r})\n"
+             "tx.call('part_a')\n"
+             "print('ready', flush=True)\n"
+             "time.sleep(60)\n")
+    worker = subprocess.Popen([sys.executable, "-c", child], stdout=subprocess.PIPE, text=True)
+    try:
+        assert worker.stdout.readline().strip() == "ready"
+        outage.update(calls=[])
+        assert recover(path13, registry=odd, log=quiet) == [] and outage["calls"] == []
+    finally:
+        worker.kill()
+        worker.wait()
+        worker.stdout.close()
+    assert recover(path13, registry=odd, log=quiet)[0]["undone"] == ["part_a-1"] and outage["calls"] == ["a"]
+
+    # ...on another machine (can't be checked from here) unless told otherwise
+    elsewhere = MemoryJournal()
+    elsewhere.append([{"tx": "t9", "event": "begin", "pid": 1, "host": "another-machine"},
+                      {"tx": "t9", "event": "started", "step": "part_a-1", "tool": "part_a", "permanent": False},
+                      {"tx": "t9", "event": "done", "step": "part_a-1", "tool": "part_a", "args": {}, "result": "a"}])
+    assert recover(elsewhere, registry=odd, log=quiet) == []
+    assert recover(elsewhere, registry=odd, log=quiet, include_live=True)[0]["undone"] == ["part_a-1"]
+
+    # --- settle records: one per settle, none for an empty transaction ---
+    path14 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    with Transaction(registry=odd, journal=path14, log=quiet) as tx:
+        tx.call("part_a")
+        tx.commit()  # explicit commit inside the block; leaving it must not write again
+    events = [r["event"] for r in FileJournal(path14).records()]
+    assert events.count("finished") == 1 and events[0] == "begin"
+    with Transaction(registry=odd, journal=path14, log=quiet):
+        pass
+    assert len(FileJournal(path14).records()) == len(events)  # nothing written
+
+    # --- acknowledge() rejects ids the journal doesn't have ---
+    expect(ValueError, acknowledge, path14, "no-such-tx")
+    expect(ValueError, acknowledge, path14, FileJournal(path14).records()[0]["tx"], "no-such-step")
+
+    # --- compact() removes a transaction once its last dead letter is acknowledged ---
+    path15 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    owed.update(down=True)
+    tx = Transaction(registry=odd, journal=path15, log=quiet)
+    tx.call("take")
+    tx.rollback()  # undo fails: owed, a dead letter
+    acknowledge(path15, tx.id, "take-1", note="released by hand")
+    assert compact(path15) == 1 and FileJournal(path15).records() == []
+    owed.update(down=False)
+
+    # --- an uncertain step is reported once, even while another undo keeps failing ---
+    down_registry = {}
+    tool(lambda flight: None, name="hold", undo=lambda r: 1 / 0, undo_retries=0, registry=down_registry)
+    tool(lambda: None, name="probe", undo=NOOP, registry=down_registry)
+    tool(lambda ref: None, name="cancel", registry=down_registry)
+    path16 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    crash_run("probe", path16)
+    with captured_warnings() as warned:
+        first = recover(path16, registry=down_registry)[0]
+        second = recover(path16, registry=down_registry)[0]
+    assert first["uncertain"] == ["p"] and second["uncertain"] == [] and second["undo_failed"] == ["h"]
+    assert sum("started but never reported" in w for w in warned) == 1
+
+    # --- compaction and reads while other processes write (Windows: no PermissionError) ---
+    path17 = os.path.join(tempfile.mkdtemp(), "j.jsonl")
+    writer = (f"import sys; sys.path.insert(0, {here!r})\n"
+              "from rubicon import FileJournal\n"
+              f"j = FileJournal({path17!r})\n"
+              "for i in range(60):\n"
+              "    j.append([{'tx': sys.argv[1] + str(i), 'event': 'begin'},\n"
+              "              {'tx': sys.argv[1] + str(i), 'event': 'finished'}])\n")
+    writers = [subprocess.Popen([sys.executable, "-c", writer, f"w{i}-"]) for i in range(3)]
+    removed = 0
+    while any(w.poll() is None for w in writers):
+        removed += compact(path17)  # rewrites the file while writers append
+        FileJournal(path17).records()
+    assert all(w.wait() == 0 for w in writers)
+    removed += compact(path17)
+    assert removed == 180 and FileJournal(path17).records() == []  # every record seen, none lost
 
     # --- tool descriptions for models ---
     class Color(enum.Enum):
