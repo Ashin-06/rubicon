@@ -13,14 +13,21 @@ Any other model or framework: build the request yourself and parse the answer.
     run(parse_plan(text))
 
 The model sees every registered tool (local or MCP) with its JSON Schema and reversibility label.
-Its output is untrusted: parse_plan() rejects malformed JSON, unknown tools, bad ids, dangling
-references and cycles before anything runs, and permanent steps still need confirmation.
+Its output is untrusted: parse_plan() rejects malformed JSON, unknown tools, bad ids, arguments
+that don't fit the tool, dangling references and cycles before anything runs, and permanent steps
+still need confirmation. agent() sends a rejected plan's error back to the model for a fix.
 """
+from __future__ import annotations
+
 import asyncio
+import inspect
 import json
 import os
 
 from rubicon import TOOLS, arun, order, run, tools_for_llm
+
+__all__ = ["CLAUDE_MODEL", "GEMINI_MODEL", "SYSTEM", "aagent", "agent", "ask_human", "parse_plan",
+           "plan_schema", "plan_with_claude", "plan_with_gemini", "plan_with_openai", "planning_request"]
 
 GEMINI_MODEL = "gemini-3.5-flash"  # measured 2026-11-08: ~10s per plan; flash-latest / 3.8 timed out
 CLAUDE_MODEL = "claude-opus-5-5"
@@ -29,11 +36,12 @@ SYSTEM = """You turn a goal into a plan of tool calls for an agent.
 Each tool is labelled reversible or not. The executor runs reversible steps first and permanent \
 steps last, dry-runs permanent steps before committing, and rolls back on failure, so you don't \
 need to order steps for safety. Focus on correctness: include every step the goal needs and no \
-others, and use "after" only for real ordering needs. Step ids may use only letters, digits, _ \
-and -. To use an earlier step's result, write "$<step id>": as a whole argument value it passes \
-the raw result, inside text it inserts it as text, and "$<step id>.<key>" picks one field of a \
-result that is an object. args_json must be a JSON object, encoded as a \
-string, matching the tool's parameters. Respond with JSON only."""
+others, and use "after" only for real ordering needs. Step ids must start with a letter and may \
+contain letters, digits, _ and - (for example "hold_seat" or "step1", never "1"). To use an \
+earlier step's result, write "$<step id>": as a whole argument value it passes the raw result, \
+inside text it inserts it as text, and "$<step id>.<key>" picks one field of a result that is an \
+object. args_json must be a JSON object, encoded as a string, using exactly the parameter names \
+in the tool's schema and every required one. Respond with JSON only."""
 
 
 def _registry(registry):
@@ -70,34 +78,42 @@ def planning_request(goal, registry=None):
 
 
 def _loads(text):
+    """Parse the first JSON object or array in the text, ignoring fences and prose around it."""
     t = text.strip()
-    if t.startswith("```"):  # ```json ... ``` fences from models without a JSON mode
-        t = t.split("\n", 1)[1] if "\n" in t else ""
-        t = t.rsplit("```", 1)[0]
     try:
         return json.loads(t)
     except ValueError:
-        i, j = t.find("{"), t.rfind("}")
-        if i == -1 or j < i:
-            raise ValueError(f"model output is not JSON: {text[:200]!r}") from None
-        return json.loads(t[i:j + 1])
+        pass
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(t):
+        if ch in "{[":
+            try:
+                return decoder.raw_decode(t, i)[0]
+            except ValueError:
+                continue
+    raise ValueError(f"model output is not JSON: {text[:200]!r}")
 
 
 def parse_plan(text, registry=None):
-    """Model output -> validated plan. Accepts {"steps": [...]} with args_json or args."""
+    """Model output -> validated plan.
+
+    Accepts {"steps": [...]} or a bare [...] list, with "args_json" (a JSON string) or "args".
+    """
     data = _loads(text)
-    steps = data.get("steps") if isinstance(data, dict) else None
+    steps = data if isinstance(data, list) else data.get("steps") if isinstance(data, dict) else None
     if not isinstance(steps, list):
         raise ValueError('model output has no "steps" list')
     plan = []
     for s in steps:
         if not isinstance(s, dict):
             raise ValueError(f"step is not an object: {s!r}")
-        args = s.get("args", {})
-        if "args_json" in s:
-            raw = s["args_json"]
-            args = (json.loads(raw) if raw.strip() else {}) if isinstance(raw, str) else raw
-        plan.append({"id": s.get("id"), "tool": s.get("tool"), "args": args, "after": s.get("after", [])})
+        args, raw = s.get("args"), s.get("args_json")
+        if isinstance(raw, str) and raw.strip():
+            args = json.loads(raw)
+        elif isinstance(raw, dict):
+            args = raw
+        plan.append({"id": s.get("id"), "tool": s.get("tool"),
+                     "args": {} if args is None else args, "after": s.get("after") or []})
     order(plan, registry)  # full validation before anything can run
     return plan
 
@@ -131,10 +147,10 @@ def plan_with_gemini(goal, client=None, registry=None, model=GEMINI_MODEL):
 
 def plan_with_claude(goal, client=None, registry=None, model=CLAUDE_MODEL):
     """Claude via anthropic. Reads ANTHROPIC_API_KEY."""
-    import anthropic
-
     req = planning_request(goal, registry)
-    client = client or anthropic.Anthropic()
+    if client is None:
+        import anthropic
+        client = anthropic.Anthropic()
     resp = client.beta.messages.create(
         model=model,
         max_tokens=16000,
@@ -146,7 +162,10 @@ def plan_with_claude(goal, client=None, registry=None, model=CLAUDE_MODEL):
     )
     if resp.stop_reason != "end_turn":
         raise RuntimeError(f"planner stopped: {resp.stop_reason} {getattr(resp, 'stop_details', '')}")
-    return parse_plan(next(b.text for b in resp.content if b.type == "text"), registry)
+    text = next((b.text for b in resp.content if b.type == "text"), None)
+    if not text:
+        raise RuntimeError("planner returned no text block")
+    return parse_plan(text, registry)
 
 
 def plan_with_openai(goal, client=None, registry=None, *, model, base_url=None, api_key=None,
@@ -158,11 +177,11 @@ def plan_with_openai(goal, client=None, registry=None, *, model, base_url=None, 
     JSON mode, or "none" for servers with neither (the schema is then put in the prompt).
     Reads OPENAI_API_KEY unless api_key is given; local servers need no key.
     """
-    import openai
-
     req = planning_request(goal, registry)
-    key = api_key or os.environ.get("OPENAI_API_KEY") or ("not-needed" if base_url else None)
-    client = client or openai.OpenAI(base_url=base_url, api_key=key, timeout=120)
+    if client is None:
+        import openai
+        key = api_key or os.environ.get("OPENAI_API_KEY") or ("not-needed" if base_url else None)
+        client = openai.OpenAI(base_url=base_url, api_key=key, timeout=120)
     prompt, extra = req["prompt"], {}
     if json_mode == "schema":
         extra["response_format"] = {"type": "json_schema",
@@ -176,6 +195,8 @@ def plan_with_openai(goal, client=None, registry=None, *, model, base_url=None, 
         messages=[{"role": "system", "content": req["system"]}, {"role": "user", "content": prompt}],
         **extra,
     )
+    if not resp.choices:
+        raise RuntimeError("planner returned no choices")
     choice = resp.choices[0]
     # servers disagree on the normal finish value ("stop", "eos", "end_turn", None), so only
     # reject the ones that mean the answer is cut off or withheld
@@ -190,21 +211,65 @@ def ask_human(steps):
     print("Permanent actions about to run:")
     for s in steps:
         print(f"  {s['id']}: {s['tool']}({s.get('args', {})})")
+        if s.get("preview") is not None:
+            print(f"      {s['preview']}")
     try:
         return input("Commit? [y/N] ").strip().lower() in ("y", "yes")
     except EOFError:  # no terminal attached: never approve by default
         return False
 
 
-def agent(goal, planner=plan_with_gemini, client=None, registry=None, confirm=ask_human, log=print):
-    """Plan with a model, then run the plan safely."""
-    return run(planner(goal, client, registry), registry, confirm, log)
+def _retry_goal(goal, error):
+    return f"{goal}\n\nYour previous plan was rejected: {error}\nWrite a corrected plan."
 
 
-async def aagent(goal, planner=plan_with_gemini, client=None, registry=None, confirm=ask_human, log=print):
-    """Async agent(): use inside event loops and with async (e.g. MCP) tools."""
-    plan = await asyncio.to_thread(planner, goal, client, registry)
-    return await arun(plan, registry, confirm, log)
+def agent(goal, planner=plan_with_gemini, client=None, registry=None, confirm=ask_human, log=print,
+          *, attempts=2, **run_kwargs):
+    """Plan with a model, then run the plan safely.
+
+    If the plan is rejected (bad JSON, unknown tool, wrong argument names, ...), the error is
+    sent back to the model for a corrected plan, up to `attempts` plans in total. run_kwargs go
+    to run(): parallel=, on_event=, journal=.
+    """
+    error = None
+    for n in range(attempts):
+        try:
+            plan = planner(goal if error is None else _retry_goal(goal, error), client, registry)
+            break
+        except ValueError as e:
+            error = e
+            if n == attempts - 1:
+                raise
+    return run(plan, registry, confirm, log, **run_kwargs)
+
+
+async def aagent(goal, planner=plan_with_gemini, client=None, registry=None, confirm=ask_human, log=print,
+                 *, attempts=2, **run_kwargs):
+    """Async agent(): use inside event loops and with async (e.g. MCP) tools.
+
+    The planner may be sync (run in a thread) or async. A sync confirm, such as the default
+    terminal prompt, runs in a thread so it doesn't block the event loop.
+    """
+    async def make_plan(g):
+        if inspect.iscoroutinefunction(planner):
+            return await planner(g, client, registry)
+        return await asyncio.to_thread(planner, g, client, registry)
+
+    error = None
+    for n in range(attempts):
+        try:
+            plan = await make_plan(goal if error is None else _retry_goal(goal, error))
+            break
+        except ValueError as e:
+            error = e
+            if n == attempts - 1:
+                raise
+    if not inspect.iscoroutinefunction(confirm):
+        sync_confirm = confirm
+
+        async def confirm(steps):
+            return await asyncio.to_thread(sync_confirm, steps)
+    return await arun(plan, registry, confirm, log, **run_kwargs)
 
 
 if __name__ == "__main__":
@@ -323,19 +388,61 @@ if __name__ == "__main__":
     for bad in ["not json", '{"plan": []}', '{"steps": [1]}',
                 json.dumps({"steps": [{**naive[2], "after": ["ghost"]}]}),
                 json.dumps({"steps": [{**naive[0], "args_json": "[1]"}]}),
-                json.dumps({"steps": [{**naive[0], "id": "has space"}]})]:
+                json.dumps({"steps": [{**naive[0], "id": "has space"}]}),
+                json.dumps({"steps": [{**naive[0], "id": "1"}]}),
+                json.dumps({"steps": [{**naive[0], "args_json": '{"booking_id": "OLD1"}'}]})]:
         expect(ValueError, parse_plan, bad, reg)
     expect(ValueError, planning_request, "x", {})  # nothing to plan with
 
-    # Async agent, and the default confirmation never approves without a terminal.
+    # Lenient parsing: braces in trailing prose, bare lists, empty args_json, null after.
+    fenced = "Here is the plan:\n```json\n" + text + "\n```\nNote: replaces {OLD1}."
+    assert [s["id"] for s in parse_plan(fenced, reg)] == ["c", "s", "h"]
+    assert len(parse_plan(json.dumps(naive), reg)) == 3
+    loose = parse_plan('{"steps": [{"id": "s", "tool": "search", "args": {"route": "x"}, '
+                       '"args_json": "", "after": null}]}', reg)
+    assert loose == [{"id": "s", "tool": "search", "args": {"route": "x"}, "after": []}]
+    assert parse_plan('[{"id": "s", "tool": "search", "args": {"route": "x"}, "args_json": null}]', reg)
+
+    # Empty responses are clear errors, not StopIteration / IndexError.
+    no_text = NS(stop_reason="end_turn", content=[NS(type="thinking")])
+    expect(RuntimeError, plan_with_claude, "x", NS(beta=NS(messages=NS(create=lambda **kw: no_text))), reg)
+    expect(RuntimeError, plan_with_openai, "x", NS(chat=NS(completions=NS(create=lambda **kw: NS(choices=[])))),
+           reg, model="m")
+
+    # A rejected plan is sent back to the model once, with the error, for a fix.
+    goals = []
+
+    def picky(goal, client, registry):
+        goals.append(goal)
+        args = '{"booking_id": "OLD1"}' if len(goals) == 1 else '{"ref": "OLD1"}'
+        return parse_plan(json.dumps([{"id": "c", "tool": "cancel_booking", "args_json": args}]), registry)
+    agent("cancel OLD1", planner=picky, registry=reg, confirm=lambda st: True, log=quiet)
+    assert len(goals) == 2 and "rejected" in goals[1] and "booking_id" in goals[1]
+    goals.clear()
+    expect(ValueError, agent, "x", planner=picky, registry=reg, attempts=1, log=quiet)
+    assert state["cancelled"] == ["OLD1"] * 4
+
+    # Async agent: sync confirm runs off the event loop thread; async planners are awaited.
+    import threading
+    threads = []
+
+    def confirm_in_thread(steps):
+        threads.append(threading.current_thread() is threading.main_thread())
+        return True
+
+    async def async_planner(goal, client, registry):
+        return parse_plan(text, registry)
+
     async def run_async():
-        return await aagent("move", client=Gemini(text), registry=reg, confirm=lambda st: True, log=quiet)
-    assert asyncio.run(run_async())["c"] is None
+        await aagent("move", client=Gemini(text), registry=reg, confirm=confirm_in_thread, log=quiet)
+        return await aagent("move", planner=async_planner, registry=reg, confirm=lambda st: True, log=quiet)
+    assert asyncio.run(run_async())["c"] is None and threads == [False]
+
     import builtins
     real_input, builtins.input = builtins.input, lambda *a: (_ for _ in ()).throw(EOFError)
     try:
-        assert ask_human([]) is False
+        assert ask_human([{"id": "c", "tool": "cancel_booking", "args": {}, "preview": "p"}]) is False
     finally:
         builtins.input = real_input
-    assert state == {"held": 4, "cancelled": ["OLD1"] * 4}
+    assert state == {"held": 5, "cancelled": ["OLD1"] * 6}
     print("all planner checks passed")
