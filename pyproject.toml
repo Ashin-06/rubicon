@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rubicon-agents"
-version = "0.8.3"
+version = "0.8.4"
 description = "Reversibility-aware execution for AI agents: undoable steps first, permanent steps last, rollback on failure."
 readme = "README.md"
 license = "MIT"

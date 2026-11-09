@@ -413,7 +413,7 @@ recover(journal, on_dead_letter=page_on_call)   # called once per new dead lette
 for letter in dead_letters(journal):            # {"tx", "step", "kind", "reason", "time"}
     ...
 acknowledge(journal, tx, step)    # that step is handled; Rubicon won't undo it
-acknowledge(journal, tx)          # the whole transaction is handled as it is
+acknowledge(journal, tx)          # the whole transaction is handled as it is (owed undos stay)
 ```
 
 - `kind` is `"undo_failed"`, `"uncertain"` (crash during an undoable step) or
@@ -421,6 +421,8 @@ acknowledge(journal, tx)          # the whole transaction is handled as it is
 - A failed undo is retried by every `recover()` run until it succeeds or is acknowledged.
 - For a crash during a permanent step, acknowledge just that step if it did not happen, and the
   next `recover()` undoes the steps it was keeping; acknowledge the whole transaction if it did.
+  Undos owed by an earlier, rolled-back stage are retried meanwhile, and acknowledging the whole
+  transaction does not cancel them; acknowledge such a step by name once it is fixed by hand.
 - `acknowledge()` raises `ValueError` for a transaction or step the journal doesn't contain, so
   a typo can't leave the real dead letter open.
 

@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.8.4
+
+### Fixed
+- A `Transaction` with a pending permanent step and a failed step, whose earlier stage owed an
+  undo that another worker acknowledged and then compacted, lost the records that said who runs
+  it, so another worker's `recover()` could undo its next stage. Every journal record now
+  carries the pid and host of the process running the transaction.
+- After a crash during a permanent step, `recover()` held back the undos an earlier,
+  rolled-back stage still owed, and `acknowledge(journal, tx)` then wiped them, leaving those
+  effects in place for good. Owed undos are now retried even while a permanent step is in
+  flight, and acknowledging the whole transaction keeps them until they succeed or are
+  acknowledged by name.
+- A failed step in a plan that had already committed a permanent step settled the transaction
+  from inside the step, ahead of the plan's own settle. The step now only records its failure.
+- `parse_plan` read an `args_json` that was a list, number or boolean as no arguments. It is
+  now refused like any other bad argument.
+
+### Tests
+- The randomised tests now crash right after a permanent step starts, run harsh rounds with
+  many declined commits and undo outages, keep a `Transaction` going after a declined commit,
+  and leave failed undos to `recover()` until the outage ends. Each fix above has a
+  regression check that fails on 0.8.3.
+
 ## 0.8.3
 
 ### Changed
