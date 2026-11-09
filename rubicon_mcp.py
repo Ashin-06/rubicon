@@ -292,7 +292,7 @@ if __name__ == "__main__":
                     order([{"id": "h", "tool": "hold_seat", "args": bad}], reg)
                     raise AssertionError("bad args should be rejected")
                 except ValueError:
-                    pass
+                    pass  # expected: the plan was rejected
             # Optional parameters left out are omitted, so the server's default applies.
             assert await reg["tag_of"].fn(text="x") == {"tag": "default"}
             assert await reg["tag_of"].fn(text="x", tag="t") == {"tag": "t"}
@@ -326,7 +326,7 @@ if __name__ == "__main__":
                     await tx.acall("cancel_booking", ref="OLD1")
                     raise RuntimeError("agent crashed")
             except RuntimeError:
-                pass
+                pass  # expected: the simulated agent crash; the rollback is checked below
             assert clean()
 
             # Happy path.
@@ -399,7 +399,7 @@ if __name__ == "__main__":
               {"hold": Tool(fake)})
         raise AssertionError("unknown argument should be rejected")
     except ValueError:
-        pass
+        pass  # expected: the undeclared argument was rejected
 
     # A session whose list_tools signature can't be inspected still lists every page.
     class Opaque:

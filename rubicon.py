@@ -419,7 +419,7 @@ def _complain(message):
     try:
         _logger.warning(message)
     except Exception:
-        pass
+        pass  # a broken logging setup must never break execution; there is nowhere left to report it
 
 
 def _jsonable(value):
@@ -1032,6 +1032,7 @@ class SQLiteJournal:
             try:
                 for i in range(0, len(tx_ids), 500):
                     chunk = tx_ids[i:i + 500]
+                    # only "?" placeholders are formatted into the SQL; the ids are bound parameters
                     db.execute(f"DELETE FROM rubicon_journal WHERE tx IN ({','.join('?' * len(chunk))})", chunk)
                 db.execute("COMMIT")
             except BaseException:
@@ -1589,7 +1590,7 @@ if __name__ == "__main__":
             tx.call("cancel_booking", ref="OLD1")
             raise RuntimeError("agent crashed")
     except RuntimeError:
-        pass
+        pass  # expected: the simulated agent crash; the rollback is checked below
     assert clean() and tx.undone == ["book_flight-1"] and tx.undo_failed == []
 
     tx = Transaction(confirm=lambda st: False, log=quiet)
@@ -1870,7 +1871,7 @@ if __name__ == "__main__":
             tx.call("break_commit")
             tx.commit()  # fails, its rollback can't undo "take", then __exit__ rolls back again
     except PlanFailed:
-        pass
+        pass  # expected: what matters is that the owed undo survives, checked below
     owed["down"] = False
     assert recover(path6, registry=odd, log=quiet)[0]["undone"] == ["take-1"] and owed["undone"] == ["seat"]
 
