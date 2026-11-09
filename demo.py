@@ -10,7 +10,6 @@ Keys can live in a .env file next to this script (git-ignored).
 import json
 import os
 import sys
-from functools import partial
 from pathlib import Path
 
 env = Path(__file__).with_name(".env")
@@ -51,6 +50,7 @@ def hold_seat(flight: str) -> dict:
 def booking_exists(ref):
     if ref not in db["bookings"]:
         raise RuntimeError(f"no booking {ref}")
+    return f"Booking {ref} will be cancelled for good."  # shown when you confirm
 
 
 @tool(check=booking_exists, registry=reg)
@@ -72,13 +72,15 @@ def send_email(to: str, body: str) -> str:
     return "sent"
 
 
+def openai_planner(goal, client, registry):
+    model = os.environ.get("OPENAI_MODEL")
+    if not model:
+        sys.exit("set OPENAI_MODEL (and OPENAI_BASE_URL for a non-OpenAI server) to use the openai planner")
+    return plan_with_openai(goal, client, registry, model=model, base_url=os.environ.get("OPENAI_BASE_URL"))
+
+
 provider = sys.argv[1] if len(sys.argv) > 1 else "gemini"
-planners = {
-    "gemini": plan_with_gemini,
-    "claude": plan_with_claude,
-    "openai": lambda goal, client, registry: plan_with_openai(
-        goal, client, registry, model=os.environ["OPENAI_MODEL"], base_url=os.environ.get("OPENAI_BASE_URL")),
-}
+planners = {"gemini": plan_with_gemini, "claude": plan_with_claude, "openai": openai_planner}
 if provider not in planners:
     sys.exit(f"unknown provider {provider!r}; choose one of {sorted(planners)}")
 
