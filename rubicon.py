@@ -17,7 +17,8 @@ Plan format (JSON-friendly, so a model can write it):
   [{"id": "hold", "tool": "hold_seat", "args": {"flight": "AI101"}},
    {"id": "mail", "tool": "send_email", "args": {"body": "Held: $hold"}, "after": ["hold"]}]
 "$<id>" as a whole argument value passes that step's raw result; inside text it inserts it as
-text. References work in nested lists/objects and add a dependency automatically.
+text. "$<id>.key.0" reaches into dict keys and list indexes. References work in nested
+lists/objects and add a dependency automatically.
 """
 import asyncio
 import concurrent.futures
@@ -58,7 +59,10 @@ def tool(fn=None, *, undo=None, check=None, name=None, registry=None):
     @tool(undo=NOOP)           read-only
     """
     def register(f):
-        (TOOLS if registry is None else registry)[name or f.__name__] = Tool(f, undo, check)
+        key = name or getattr(f, "__name__", None)
+        if not key:
+            raise ValueError(f"{f!r} has no __name__; pass tool(..., name='...')")
+        (TOOLS if registry is None else registry)[key] = Tool(f, undo, check)
         return f
     return register(fn) if fn is not None else register
 
@@ -76,8 +80,12 @@ def _schema(fn):
         hints = typing.get_type_hints(fn)
     except Exception:
         hints = {}
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):  # some builtins and C functions have no signature
+        return {"type": "object"}
     props, required = {}, []
-    for p in inspect.signature(fn).parameters.values():
+    for p in params:
         if p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
             continue
         h = hints.get(p.name)
@@ -108,7 +116,7 @@ class PlanFailed(Exception):
 
 
 _ID = re.compile(r"[\w-]+")
-_REF = re.compile(r"\$([\w-]+)")
+_REF = re.compile(r"\$([\w-]+)((?:\.[\w-]+)*)")  # $id, optionally followed by .key.0 path
 
 
 def _walk(v, f):
@@ -124,16 +132,39 @@ def _walk(v, f):
 def _refs(args, ids):
     """Step ids referenced as "$id" anywhere in args ("$50" etc. are not references)."""
     found = []
-    _walk(args, lambda s: found.extend(m for m in _REF.findall(s) if m in ids) or s)
+    _walk(args, lambda s: found.extend(m for m, _ in _REF.findall(s) if m in ids) or s)
     return found
 
 
+def _dig(value, path):
+    """Follow a ".key.0" path into dicts and lists. Raises LookupError if it doesn't exist."""
+    for part in filter(None, path.split(".")):
+        if isinstance(value, dict) and part in value:
+            value = value[part]
+        elif isinstance(value, (list, tuple)) and part.lstrip("-").isdigit() and -len(value) <= int(part) < len(value):
+            value = value[int(part)]
+        else:
+            raise LookupError(f"no {part!r} in {value!r}")
+    return value
+
+
 def _resolve(args, results):
+    def embed(m):
+        if m[1] not in results:
+            return m[0]
+        try:
+            return str(_dig(results[m[1]], m[2]))
+        except LookupError:  # e.g. "Booked $hold.Thanks": keep the text after the value
+            return str(results[m[1]]) + m[2]
+
     def sub(s):
         m = _REF.fullmatch(s)
         if m and m[1] in results:
-            return results[m[1]]
-        return _REF.sub(lambda m: str(results[m[1]]) if m[1] in results else m[0], s)
+            try:
+                return _dig(results[m[1]], m[2])
+            except LookupError as e:
+                raise ValueError(f"reference {s!r}: {e}") from None
+        return _REF.sub(embed, s)
     return _walk(args, sub)
 
 
@@ -452,6 +483,22 @@ if __name__ == "__main__":
     # references: inside text, nested, and "$50" left alone
     assert _resolve({"b": "held $hold for $50", "w": "$hold", "n": [{"x": "$hold"}]},
                     {"hold": {"f": 1}}) == {"b": "held {'f': 1} for $50", "w": {"f": 1}, "n": [{"x": {"f": 1}}]}
+    # paths into results: dict keys, list indexes, end-of-sentence dots, missing keys
+    res = {"hold": {"flight": "AI101", "legs": [{"no": 7}]}}
+    assert _resolve({"a": "$hold.flight", "b": "$hold.legs.0.no", "c": "on $hold.flight.",
+                     "d": "$hold.legs.-1", "e": "Booked $hold.Thanks"}, res) == \
+        {"a": "AI101", "b": 7, "c": "on AI101.", "d": {"no": 7},
+         "e": "Booked {'flight': 'AI101', 'legs': [{'no': 7}]}.Thanks"}
+    expect(ValueError, _resolve, {"a": "$hold.nope"}, res)
+    assert [s["id"] for s in order([
+        {"id": "m", "tool": "send_email", "args": {"to": "a@b", "body": "$h.flight"}},
+        {"id": "h", "tool": "book_flight", "args": {"flight": "AI101"}}])] == ["h", "m"]
+    # tool() edge cases: objects without __name__, signatures that can't be inspected
+    expect(ValueError, tool, functools.partial(print), registry={})
+    odd = {}
+    tool(functools.partial(print), name="say", registry=odd)
+    tool(len, name="length", undo=NOOP, registry=odd)
+    assert [t["name"] for t in tools_for_llm(odd)] == ["say", "length"]
     assert [s["id"] for s in order([
         {"id": "m", "tool": "send_email", "args": {"to": "a@b", "body": ["ref", "$h", "$50"]}},
         {"id": "h", "tool": "book_flight", "args": {"flight": "AI101"}}])] == ["h", "m"]
