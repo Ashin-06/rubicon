@@ -31,6 +31,7 @@ import inspect
 import json
 import os
 import re
+import sys
 import threading
 import time
 import types
@@ -307,15 +308,20 @@ async def _call(fn, *args, **kwargs):
 async def _attempt(fn, args, kwargs, retries, timeout):
     """Call with optional timeout (async only) and retries with exponential backoff."""
     for n in range(retries + 1):
+        is_async = False
         try:
             r = fn(*args, **kwargs)
             if inspect.isawaitable(r):
+                is_async = True
                 r = await (asyncio.wait_for(r, timeout) if timeout else r)
             return r
         except Exception:
             if n == retries:
                 raise
-            await asyncio.sleep(RETRY_DELAY * 2 ** n)
+            if is_async:
+                await asyncio.sleep(RETRY_DELAY * 2 ** n)
+            else:  # a sync tool waits synchronously, so it also works from sync code in a running loop
+                time.sleep(RETRY_DELAY * 2 ** n)
 
 
 def _takes_args(undo) -> bool:
@@ -350,6 +356,13 @@ def _sync(coro, drive=False):
 
 
 _MARK = "__unserializable__"
+
+
+def _complain(message):
+    try:
+        sys.stderr.write(message + "\n")
+    except Exception:
+        pass
 
 
 def _jsonable(value):
@@ -471,7 +484,16 @@ class Transaction:
 
     def _emit(self, event, **data):
         if self.on_event:
-            self.on_event({"event": event, "tx": self.id, "time": time.time(), **data})
+            try:
+                self.on_event({"event": event, "tx": self.id, "time": time.time(), **data})
+            except Exception as e:  # observability must never change what runs or gets undone
+                _complain(f"rubicon: on_event callback failed: {e!r}")
+
+    def _say(self, message):
+        try:
+            self.log(message)
+        except Exception as e:
+            _complain(f"rubicon: log callback failed: {e!r}")
 
     def _write(self, event, **data):
         if not self._journal:
@@ -501,9 +523,15 @@ class Transaction:
 
     async def _run(self, label, name, a, k, view, permanent):
         t = self._tool(name)
+        # write-ahead: if the process dies mid-step, recover() knows this step may have happened
+        self._write("started", step=label, tool=name, permanent=permanent)
         self._emit("step_started", step=label, tool=name, permanent=permanent)
         start = time.perf_counter()
-        r = await _attempt(t.fn, a, k, t.retries, t.timeout)
+        try:
+            r = await _attempt(t.fn, a, k, t.retries, t.timeout)
+        except BaseException as e:
+            self._write("step_failed", step=label, tool=name, error=repr(e))
+            raise
         ms = round((time.perf_counter() - start) * 1000, 1)
         self.results[label] = r
         if permanent:
@@ -511,12 +539,12 @@ class Transaction:
             self.done.clear()  # everything before a committed step is now part of the result
             self._write("committed", step=label, tool=name)
             self._emit("step_committed", step=label, tool=name, duration_ms=ms)
-            self.log(f"COMMITTED {label}")
+            self._say(f"COMMITTED {label}")
         else:
             self.done.append({"id": label, "tool": name, "args": view, "result": r})
             self._write("done", step=label, tool=name, args=_jsonable(view), result=_jsonable(r))
             self._emit("step_done", step=label, tool=name, duration_ms=ms)
-            self.log(f"ran {label}")
+            self._say(f"ran {label}")
         return r
 
     async def _check(self, label, name, a, k, view):
@@ -564,7 +592,7 @@ class Transaction:
                 failed.append(rec["id"])
                 self._write("undo_failed", step=rec["id"], error=repr(e))
                 self._emit("undo_failed", step=rec["id"], tool=rec["tool"], error=repr(e))
-                self.log(f"undo of {rec['id']} failed: {e!r}")
+                self._say(f"undo of {rec['id']} failed: {e!r}")
                 if not isinstance(e, Exception) and interrupted is None:
                     interrupted = e
         self.pending.clear()
@@ -681,7 +709,9 @@ async def _waves(tx, steps, deps, execute):
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
         for task in done:
-            if not task.cancelled() and task.exception() is not None:
+            if task.cancelled():  # cancelled from inside (e.g. a library's cancel scope): not finished
+                raise _StepFailed(tasks[task], RuntimeError(f"step {tasks[task]!r} was cancelled before it finished"))
+            if task.exception() is not None:
                 raise _StepFailed(tasks[task], task.exception())
         for sid in tasks.values():
             finished.add(sid)
@@ -776,7 +806,13 @@ async def arecover(journal, registry=None, log=print) -> list[dict]:
     anything twice. A transaction is marked finished only when every undo succeeded; run
     recover() again later to retry the ones in "undo_failed".
 
-    Returns one report per transaction: {"tx", "undone", "undo_failed", "committed"}.
+    If the crash happened while a permanent step was running, nobody knows whether it went
+    through, so nothing is undone (undoing what it relied on could leave things worse) and the
+    step is listed in "needs_attention" for a person to check. An undoable step that started but
+    never reported a result is listed in "uncertain".
+
+    Returns one report per transaction:
+    {"tx", "undone", "undo_failed", "committed", "uncertain", "needs_attention", "kept"}.
     """
     tools = TOOLS if registry is None else registry
     if not os.path.exists(journal):
@@ -790,22 +826,45 @@ async def arecover(journal, registry=None, log=print) -> list[dict]:
                 rec = json.loads(line)
             except ValueError:  # a torn last line from the crash itself
                 continue
-            tx = txs.setdefault(rec["tx"], {"done": [], "committed": [], "finished": False})
-            event = rec["event"]
-            if event == "done":
+            tx = txs.setdefault(rec["tx"], {"done": [], "committed": [], "open": {}, "finished": False})
+            event, step = rec["event"], rec.get("step")
+            if event in ("started", "done", "committed"):
+                tx["finished"] = False  # new activity reopens a transaction that committed in stages
+            if event == "started":
+                tx["open"][step] = rec
+            elif event == "done":
+                tx["open"].pop(step, None)
                 tx["done"].append(rec)
             elif event == "committed":
-                tx["committed"].append(rec["step"])
+                tx["open"].pop(step, None)
+                tx["committed"].append(step)
                 tx["done"].clear()
+            elif event == "step_failed":
+                tx["open"].pop(step, None)
             elif event == "undone":
-                tx["done"] = [d for d in tx["done"] if d["step"] != rec["step"]]
-            elif event == "finished":
+                tx["done"] = [d for d in tx["done"] if d["step"] != step]
+            elif event == "finished":  # everything before this is settled (committed or undone)
                 tx["finished"] = True
+                tx["done"].clear()
+                tx["open"].clear()
     reports = []
     for tx_id, tx in txs.items():
         if tx["finished"]:
             continue
-        undone, failed = [], []
+        in_flight = [s for s, r in tx["open"].items() if r.get("permanent")]
+        uncertain = [s for s, r in tx["open"].items() if not r.get("permanent")]
+        report = {"tx": tx_id, "undone": [], "undo_failed": [], "committed": tx["committed"],
+                  "uncertain": uncertain, "needs_attention": in_flight, "kept": []}
+        if in_flight:
+            report["kept"] = [d["step"] for d in tx["done"]]
+            log(f"recover: transaction {tx_id} crashed during permanent step(s) {in_flight}; it may or "
+                f"may not have happened, so {report['kept']} were kept. Check by hand.")
+            reports.append(report)
+            continue
+        if uncertain:
+            log(f"recover: step(s) {uncertain} of {tx_id} started but never reported a result; "
+                f"they may have happened and can't be undone automatically.")
+        undone, failed = report["undone"], report["undo_failed"]
         for rec in reversed(tx["done"]):
             t = tools.get(rec["tool"])
             result, args = rec.get("result"), rec.get("args", {})
@@ -825,7 +884,7 @@ async def arecover(journal, registry=None, log=print) -> list[dict]:
                 log(f"recover: undo of {rec['step']} failed: {e!r}")
         if not failed:
             _append(journal, {"tx": tx_id, "event": "finished", "status": "recovered"})
-        reports.append({"tx": tx_id, "undone": undone, "undo_failed": failed, "committed": tx["committed"]})
+        reports.append(report)
     return reports
 
 
@@ -1284,6 +1343,89 @@ if __name__ == "__main__":
     assert tx.undo_failed == ["part_b-1"]
     outage["down"] = False
     assert recover(path2, registry=odd, log=quiet)[0]["undone"] == ["part_b-1"]
+
+    # recover() also covers a Transaction that committed in stages and crashed in a later stage
+    path3 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    outage.update(down=False, calls=[])
+    tx = Transaction(registry=odd, journal=path3, log=quiet)
+    tx.call("part_a")
+    tx.commit()  # stage 1 done: part_a is final
+    tx.call("part_b")  # stage 2... crash
+    staged = recover(path3, registry=odd, log=quiet)
+    assert staged[0]["undone"] == ["part_b-2"] and outage["calls"] == ["b"]
+
+    # a step that cancels itself inside a parallel wave is a failure, not a finished step
+    @tool(undo=NOOP, registry=reg)
+    async def self_cancel():
+        raise asyncio.CancelledError()
+    e = expect(PlanFailed, lambda: asyncio.run(arun([{"id": "sc", "tool": "self_cancel"},
+                                                    {"id": "r", "tool": "reserve", "args": {"x": 1}}],
+                                                   registry=reg, log=quiet, parallel=True)))
+    assert e.step == "sc" and "cancelled" in str(e.cause)
+
+    # a sync tool's retries also work through tx.call() inside a running event loop
+    tries = []
+
+    @tool(undo=NOOP, retries=2, registry=odd)
+    def blip():
+        tries.append(1)
+        if len(tries) < 2:
+            raise ConnectionError("blip")
+        return "ok"
+
+    async def in_framework():
+        return Transaction(registry=odd, log=quiet).call("blip")
+    assert asyncio.run(in_framework()) == "ok" and len(tries) == 2
+
+    # a broken on_event or log callback never changes what runs or gets undone
+    def broken(*a):
+        raise RuntimeError("logging backend down")
+    import io
+    import contextlib
+    with contextlib.redirect_stderr(io.StringIO()) as err:
+        assert run(plan(), on_event=broken, log=broken) == {"find": ["AI101"], "hold": {"flight": "AI101"},
+                                                            "cancel": None, "mail": None}
+    assert "on_event callback failed" in err.getvalue() and "log callback failed" in err.getvalue()
+    reset()
+
+    # a real crash (the process dies) in the middle of a step
+    import subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+
+    def crash_run(dies_in, journal_path):
+        child = (
+            "import os, sys\n"
+            f"sys.path.insert(0, {here!r})\n"
+            "from rubicon import tool, run, NOOP\n"
+            "reg = {}\n"
+            "tool(lambda flight: {'flight': flight}, name='hold', undo=NOOP, registry=reg)\n"
+            f"tool(lambda: os._exit(3) if {dies_in!r} == 'probe' else 'x', name='probe', undo=NOOP, registry=reg)\n"
+            f"tool(lambda ref: os._exit(3) if {dies_in!r} == 'cancel' else 'ok', name='cancel', registry=reg)\n"
+            "run([{'id': 'h', 'tool': 'hold', 'args': {'flight': 'AI101'}},\n"
+            "     {'id': 'p', 'tool': 'probe', 'after': ['h']},\n"
+            "     {'id': 'c', 'tool': 'cancel', 'args': {'ref': 'OLD1'}}],\n"
+            f"    registry=reg, journal={journal_path!r}, log=lambda m: None)\n")
+        assert subprocess.run([sys.executable, "-c", child]).returncode == 3
+
+    released = []
+    after_crash = {}
+    tool(lambda flight: None, name="hold", undo=lambda r: released.append(r), registry=after_crash)
+    tool(lambda: None, name="probe", undo=NOOP, registry=after_crash)
+    tool(lambda ref: None, name="cancel", registry=after_crash)
+
+    # dies during the permanent cancel: it may have gone through, so the hold must be kept
+    path4 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    crash_run("cancel", path4)
+    rep = recover(path4, registry=after_crash, log=quiet)[0]
+    assert rep["needs_attention"] == ["c"] and rep["kept"] == ["h", "p"] and released == []
+    assert recover(path4, registry=after_crash, log=quiet)[0]["needs_attention"] == ["c"]  # still flagged
+
+    # dies during an undoable step: completed steps are undone, the half-run one is reported
+    path5 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    crash_run("probe", path5)
+    rep = recover(path5, registry=after_crash, log=quiet)[0]
+    assert rep["undone"] == ["h"] and rep["uncertain"] == ["p"] and released == [{"flight": "AI101"}]
+    assert recover(path5, registry=after_crash, log=quiet) == []
 
     # --- tool descriptions for models ---
     class Color(enum.Enum):
