@@ -324,12 +324,20 @@ def _pid_alive(pid) -> bool:
         return False
     if os.name == "nt":
         import ctypes
+        from ctypes import wintypes
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # declare the real signatures: a HANDLE is 64-bit and would be truncated as a default int
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
         handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
         if not handle:
             return ctypes.get_last_error() == 5  # access denied: it exists
         try:
-            code = ctypes.c_ulong()
+            code = wintypes.DWORD()
             if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
                 return True
             return code.value == 259  # STILL_ACTIVE
@@ -341,7 +349,12 @@ def _pid_alive(pid) -> bool:
         return False
     except PermissionError:
         return True
-    return True
+    try:  # Linux: a zombie (exited, not yet reaped by its parent) still answers kill(pid, 0)
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            state = f.read().rsplit(b")", 1)[-1].split()[:1]
+        return state not in ([b"Z"], [b"X"])
+    except OSError:
+        return True
 
 
 async def _attempt(fn, args, kwargs, retries, timeout):
@@ -546,14 +559,14 @@ class Transaction:
         records = [{"tx": self.id, "event": event, "time": now, **data}]
         with self._lock:
             if not self._began:
-                self._began = True
                 # who runs this transaction, so recover() elsewhere can tell it's still alive
                 records.insert(0, {"tx": self.id, "event": "begin", "time": now, "pid": os.getpid(),
                                    "host": _HOST})
+            self._journal.append(records)  # state changes below only once this succeeded
+            self._began = True
             if event in ("started", "done", "committed"):
                 self._dirty = True
                 _LIVE.add(self.id)
-            self._journal.append(records)
 
     def _settle(self, status):
         """Journal that everything so far is committed or undone. While an earlier undo is still
@@ -585,7 +598,11 @@ class Transaction:
         try:
             r = await _attempt(t.fn, a, k, t.retries, t.timeout)
         except BaseException as e:
-            self._write("step_failed", step=label, tool=name, error=repr(e))
+            try:
+                self._write("step_failed", step=label, tool=name, error=repr(e))
+            finally:
+                if not self.done and not self.pending:  # nothing outstanding: not live any more
+                    _LIVE.discard(self.id)
             raise
         ms = round((time.perf_counter() - start) * 1000, 1)
         self.results[label] = r
@@ -762,11 +779,14 @@ async def _waves(tx, steps, deps, execute):
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
-        for task in done:
+        failures = []
+        for task in sorted(done, key=lambda t: tasks[t]):  # collect every outcome, so none is left unread
             if task.cancelled():  # cancelled from inside (e.g. a library's cancel scope): not finished
-                raise _StepFailed(tasks[task], RuntimeError(f"step {tasks[task]!r} was cancelled before it finished"))
-            if task.exception() is not None:
-                raise _StepFailed(tasks[task], task.exception())
+                failures.append((tasks[task], RuntimeError(f"step {tasks[task]!r} was cancelled before it finished")))
+            elif task.exception() is not None:
+                failures.append((tasks[task], task.exception()))
+        if failures:
+            raise _StepFailed(*failures[0])
         for sid in tasks.values():
             finished.add(sid)
             del remaining[sid]
@@ -1072,6 +1092,7 @@ def _replay(records):
             tx["owed"].pop(step, None)
             letters.pop((tx_id, step), None)
         elif event == "resolved":
+            tx["settled"] = True  # a person looked at it: it isn't running
             if step:
                 for part in ("open", "done", "owed"):
                     tx[part].pop(step, None)
@@ -1095,6 +1116,8 @@ def _replay(records):
 
 def _maybe_running(tx) -> bool:
     """Whether a transaction may still be running, so recover() must leave it alone."""
+    if tx["settled"]:
+        return False  # settled and not reopened: only an owed undo can be left, and nothing runs
     begin = tx["begin"]
     if not begin or "pid" not in begin:
         return False  # written before liveness was recorded
@@ -2037,6 +2060,56 @@ if __name__ == "__main__":
                       {"tx": "t9", "event": "done", "step": "part_a-1", "tool": "part_a", "args": {}, "result": "a"}])
     assert recover(elsewhere, registry=odd, log=quiet) == []
     assert recover(elsewhere, registry=odd, log=quiet, include_live=True)[0]["undone"] == ["part_a-1"]
+
+    # ...but a settled transaction that owes an undo is retried even while its worker lives on
+    path18 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    child = (f"import sys, time; sys.path.insert(0, {here!r})\n"
+             "from rubicon import Transaction, tool\n"
+             "reg = {}\n"
+             "def release(r):\n"
+             "    raise ConnectionError('service down')\n"
+             "tool(lambda: 'seat', name='take', undo=release, undo_retries=0, registry=reg)\n"
+             f"tx = Transaction(registry=reg, journal={path18!r}, log=lambda m: None)\n"
+             "tx.call('take')\n"
+             "tx.rollback()\n"
+             "print('ready', flush=True)\n"
+             "time.sleep(60)\n")
+    worker = subprocess.Popen([sys.executable, "-c", child], stdout=subprocess.PIPE, text=True)
+    try:
+        assert worker.stdout.readline().strip() == "ready"
+        owed.update(down=False, undone=[])
+        assert recover(path18, registry=odd, log=quiet)[0]["undone"] == ["take-1"] and owed["undone"] == ["seat"]
+    finally:
+        worker.kill()
+        worker.wait()
+        worker.stdout.close()
+
+    # a crashed transaction whose last open items are acknowledged can be compacted
+    path19 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    crash_run("probe", path19)
+    hold_down = {}
+    tool(lambda flight: None, name="hold", undo=lambda r: 1 / 0, undo_retries=0, registry=hold_down)
+    tool(lambda: None, name="probe", undo=NOOP, registry=hold_down)
+    tool(lambda ref: None, name="cancel", registry=hold_down)
+    rep = recover(path19, registry=hold_down, log=quiet)[0]  # "h" undo fails, "p" uncertain
+    acknowledge(path19, rep["tx"], "h")
+    acknowledge(path19, rep["tx"], "p")
+    assert compact(path19) == 1 and FileJournal(path19).records() == []
+
+    # a standalone call whose first step fails leaves nothing marked live
+    lone = Transaction(journal=os.path.join(tempfile.mkdtemp(), "j.jsonl"), log=quiet)
+    expect(RuntimeError, lone.call, "book_flight", flight="XX9")
+    assert lone.id not in _LIVE
+
+    # liveness: running, killed, and (Linux) zombie processes
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    assert _pid_alive(sleeper.pid)
+    sleeper.kill()
+    if sys.platform.startswith("linux"):
+        time.sleep(0.5)  # exited but not reaped yet: a zombie
+        assert not _pid_alive(sleeper.pid)
+    sleeper.wait()
+    assert not _pid_alive(sleeper.pid) and _pid_alive(os.getpid()) and not _pid_alive(0)
 
     # --- settle records: one per settle, none for an empty transaction ---
     path14 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
