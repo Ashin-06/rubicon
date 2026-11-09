@@ -536,6 +536,7 @@ class Transaction:
         self.undone, self.undo_failed = [], []
         self._journal, self._lock, self._counter = _as_journal(journal), threading.Lock(), 0
         self._began = self._dirty = False
+        self._running = set()  # labels of steps currently executing
 
     # -- bookkeeping
 
@@ -576,6 +577,9 @@ class Transaction:
         if self._dirty:
             self._write("finished" if not self.undo_failed else "settled", status=status)
             self._dirty = False
+            # a later stage starts afresh with its own "begin" (pid and host): once settled, its
+            # records can be compacted away (after a person acknowledges what was owed, too)
+            self._began = False
 
     def _label(self, name):
         with self._lock:
@@ -594,16 +598,23 @@ class Transaction:
         # write-ahead: if the process dies mid-step, recover() knows this step may have happened
         self._write("started", step=label, tool=name, permanent=permanent)
         self._emit("step_started", step=label, tool=name, permanent=permanent)
+        self._running.add(label)
         start = time.perf_counter()
         try:
             r = await _attempt(t.fn, a, k, t.retries, t.timeout)
         except BaseException as e:
+            self._running.discard(label)
             try:
                 self._write("step_failed", step=label, tool=name, error=repr(e))
             finally:
-                if not self.done and not self.pending:  # nothing outstanding: not live any more
-                    _LIVE.discard(self.id)
+                if not (self.done or self.pending or self._running):
+                    # nothing outstanding: settle, so the journal doesn't show it as running
+                    try:
+                        self._settle("step_failed")
+                    except BaseException:
+                        _LIVE.discard(self.id)
             raise
+        self._running.discard(label)
         ms = round((time.perf_counter() - start) * 1000, 1)
         self.results[label] = r
         if permanent:
@@ -1059,8 +1070,8 @@ def _replay(records):
         if not tx_id or not event:
             continue
         rec = {**rec, "_pos": position}
-        tx = txs.setdefault(tx_id, {"done": {}, "owed": {}, "committed": [], "open": {}, "finished": False,
-                                    "settled": False, "begin": None})
+        tx = txs.setdefault(tx_id, {"id": tx_id, "done": {}, "owed": {}, "committed": [], "open": {},
+                                    "finished": False, "settled": False, "begin": None})
         if event in ("started", "done", "committed"):
             # new activity reopens a transaction that committed in stages
             tx["finished"] = tx["settled"] = False
@@ -1076,6 +1087,8 @@ def _replay(records):
             tx["committed"].append(step)
             tx["done"].clear()
         elif event == "step_failed":
+            # not "settled": a live Transaction may hold permanent steps that are only journaled
+            # at commit. The Transaction settles itself when nothing is outstanding.
             tx["open"].pop(step, None)
         elif event == "undo_failed":
             if step in tx["done"]:
@@ -1092,15 +1105,16 @@ def _replay(records):
             tx["owed"].pop(step, None)
             letters.pop((tx_id, step), None)
         elif event == "resolved":
-            tx["settled"] = True  # a person looked at it: it isn't running
             if step:
                 for part in ("open", "done", "owed"):
                     tx[part].pop(step, None)
                 letters.pop((tx_id, step), None)
-            else:
+                if not (tx["open"] or tx["done"] or tx["owed"]):
+                    tx["settled"] = True  # that was the last open item; other stages may still run
+            else:  # the whole transaction was handled by a person
                 for part in ("open", "done", "owed"):
                     tx[part].clear()
-                tx["finished"] = True
+                tx["finished"] = tx["settled"] = True
                 for key in [k for k in letters if k[0] == tx_id]:
                     del letters[key]
         elif event in ("settled", "finished"):  # everything before this is committed or undone
@@ -1116,6 +1130,8 @@ def _replay(records):
 
 def _maybe_running(tx) -> bool:
     """Whether a transaction may still be running, so recover() must leave it alone."""
+    if tx["id"] in _LIVE:
+        return True  # running in this process, whatever the journal says
     if tx["settled"]:
         return False  # settled and not reopened: only an owed undo can be left, and nothing runs
     begin = tx["begin"]
@@ -1228,8 +1244,8 @@ async def arecover(journal, registry=None, log=None, *, on_dead_letter=None, inc
                     j.append([_record("undo_failed", tx_id, step=rec["step"], error=repr(e))])
                     dead_letter(rec["step"], "undo_failed", repr(e), write=False)
                     say(f"recover: undo of {rec['step']} failed: {e!r}")
-            if not report["undo_failed"]:
-                j.append([_record("finished", tx_id, status="recovered")])
+            # "settled" when an undo is still owed: recovery handled it, nothing runs, retry later
+            j.append([_record("settled" if report["undo_failed"] else "finished", tx_id, status="recovered")])
             reports.append(report)
         return reports
 
@@ -2110,6 +2126,99 @@ if __name__ == "__main__":
         assert not _pid_alive(sleeper.pid)
     sleeper.wait()
     assert not _pid_alive(sleeper.pid) and _pid_alive(os.getpid()) and not _pid_alive(0)
+
+    # --- maintenance while a staged transaction runs never touches the running stage ---
+    class OtherProcess:
+        """The journal as another worker sees it: this process is a live process it can't look
+        inside (its pid is swapped for the parent's), and nothing is in that worker's _LIVE."""
+
+        def __init__(self, path):
+            self.j = FileJournal(path)
+
+        def append(self, records):
+            self.j.append(records)
+
+        def records(self):
+            return [{**r, "pid": os.getppid()} if r.get("event") == "begin" else r for r in self.j.records()]
+
+        def drop(self, tx_ids):
+            self.j.drop(tx_ids)
+
+    @contextlib.contextmanager
+    def from_other_process(path):
+        hidden = set(_LIVE)
+        _LIVE.clear()
+        try:
+            yield OtherProcess(path)
+        finally:
+            _LIVE.update(hidden)
+
+    stage = {}
+    stage_undone = []
+    tool(lambda: "a", name="sa", undo=lambda r: stage_undone.append("a"), registry=stage)
+    tool(lambda: "b", name="sb", undo=lambda r: stage_undone.append("b"), registry=stage)
+    tool(lambda: 1 / 0, name="sbroken", undo=NOOP, registry=stage)
+    tool(lambda: "c", name="sc", undo=lambda r: 1 / 0, undo_retries=0, registry=stage)
+    tool(lambda: "p", name="sp", registry=stage)
+
+    # compact() between stages, then a live stage 2
+    path20 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    tx = Transaction(registry=stage, journal=path20, log=quiet)
+    tx.call("sa")
+    tx.commit()
+    assert compact(path20) == 1  # stage 1 removed, "begin" included
+    tx.call("sb")
+    assert [r["event"] for r in FileJournal(path20).records()][0] == "begin"  # stage 2 has its own
+    with from_other_process(path20) as other:
+        assert recover(other, registry=stage, log=quiet) == [] and stage_undone == []
+    assert recover(path20, registry=stage, log=quiet) == []  # and in this process
+    tx.rollback()
+
+    # acknowledging stage 1's failed undo while stage 2 runs
+    path21 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    tx = Transaction(registry=stage, journal=path21, log=quiet)
+    tx.call("sc")
+    tx.rollback()  # undo fails: owed
+    tx.call("sb")  # stage 2, running
+    acknowledge(path21, tx.id, "sc-1")
+    stage_undone.clear()
+    with from_other_process(path21) as other:
+        assert recover(other, registry=stage, log=quiet) == [] and stage_undone == []
+    tx.rollback()
+
+    # a stage whose rollback owed an undo, acknowledged and compacted by another worker,
+    # followed by a new stage (found by the randomised tests, seed 3079722)
+    path24 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    tx = Transaction(registry=stage, journal=path24, log=quiet)
+    tx.call("sc")
+    tx.rollback()  # undo fails: "settled", owed
+    with from_other_process(path24) as other:
+        acknowledge(other, tx.id, "sc-1", note="fixed by hand")
+        assert compact(other) == 1  # nothing left: removed, "begin" included
+    tx.call("sb")  # the next stage
+    stage_undone.clear()
+    with from_other_process(path24) as other:
+        assert recover(other, registry=stage, log=quiet) == [] and stage_undone == []
+    tx.rollback()
+
+    # a lone failed first step settles itself, so it can be compacted
+    path22 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    lone = Transaction(registry=stage, journal=path22, log=quiet)
+    expect(ZeroDivisionError, lone.call, "sbroken")
+    assert compact(path22) == 1
+
+    # ...but not while a permanent step is pending: the journal doesn't know about it yet
+    path23 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    tx = Transaction(registry=stage, journal=path23, log=quiet)
+    tx.call("sp")  # scheduled, not journaled until commit
+    expect(ZeroDivisionError, tx.call, "sbroken")
+    with from_other_process(path23) as other:
+        compact(other)  # must not remove the running transaction's "begin"
+    tx.call("sb")
+    stage_undone.clear()
+    with from_other_process(path23) as other:
+        assert recover(other, registry=stage, log=quiet) == [] and stage_undone == []
+    tx.rollback()
 
     # --- settle records: one per settle, none for an empty transaction ---
     path14 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
