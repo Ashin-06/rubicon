@@ -30,10 +30,11 @@ __all__ = ["CLAUDE_MODEL", "GEMINI_MODEL", "PlanRejected", "SYSTEM", "aagent", "
            "parse_plan", "plan_schema", "plan_with_claude", "plan_with_gemini", "plan_with_openai",
            "planning_request"]
 
-# Defaults can be overridden with environment variables (or a .env loaded before import).
+# Default models. The GEMINI_MODEL / CLAUDE_MODEL environment variables override them, read
+# each time a planner runs, so loading a .env after importing this module still works.
 # gemini-3.5-flash measured 2026-11-08 at ~10s per plan; flash-latest and 3.8 timed out then.
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL") or "gemini-3.5-flash"
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL") or "claude-opus-5-5"
+GEMINI_MODEL = "gemini-3.5-flash"
+CLAUDE_MODEL = "claude-opus-5-5"
 
 
 class PlanRejected(ValueError):
@@ -137,11 +138,12 @@ def _parse_plan(text, registry):
     return plan
 
 
-def plan_with_gemini(goal, client=None, registry=None, model=GEMINI_MODEL):
+def plan_with_gemini(goal, client=None, registry=None, model=None):
     """Gemini via google-genai. Reads GEMINI_API_KEY (or GOOGLE_API_KEY)."""
     from google import genai
     from google.genai import types
 
+    model = model or os.environ.get("GEMINI_MODEL") or GEMINI_MODEL
     req = planning_request(goal, registry)
     # timeout is in ms so a stalled model can't hang forever; retry rate limits and overloads
     # (429/5xx) like the Anthropic and OpenAI SDKs do by default
@@ -164,8 +166,9 @@ def plan_with_gemini(goal, client=None, registry=None, model=GEMINI_MODEL):
     return parse_plan(resp.text, registry)
 
 
-def plan_with_claude(goal, client=None, registry=None, model=CLAUDE_MODEL):
+def plan_with_claude(goal, client=None, registry=None, model=None):
     """Claude via anthropic. Reads ANTHROPIC_API_KEY."""
+    model = model or os.environ.get("CLAUDE_MODEL") or CLAUDE_MODEL
     req = planning_request(goal, registry)
     if client is None:
         import anthropic
@@ -381,6 +384,20 @@ if __name__ == "__main__":
         ["cancel_booking", "hold_seat", "search"]
     assert '"reversible": false' in g.kw["contents"] and '"type": "string"' in g.kw["contents"]
     assert "SAFETY" in str(expect(RuntimeError, plan_with_gemini, "x", Gemini(""), reg))
+
+    # model env vars set after import (e.g. by load_dotenv) still apply; model= wins over both
+    os.environ["GEMINI_MODEL"], os.environ["CLAUDE_MODEL"] = "late-gemini", "late-claude"
+    try:
+        g = Gemini(text)
+        plan_with_gemini("x", g, reg)
+        assert g.kw["model"] == "late-gemini"
+        plan_with_gemini("x", g, reg, model="explicit")
+        assert g.kw["model"] == "explicit"
+        c = Claude(text)
+        plan_with_claude("x", c, reg)
+        assert c.kw["model"] == "late-claude"
+    finally:
+        del os.environ["GEMINI_MODEL"], os.environ["CLAUDE_MODEL"]
 
     # Claude.
     c = Claude(text)
