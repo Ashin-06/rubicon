@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.7.0
+
+### Added
+- Pluggable journals: `FileJournal` (the default for a path), `SQLiteJournal` for many processes
+  and threads on one machine, or any object with `append(records)` and `records()` (and
+  optionally `lock()` and `drop()`) for shared stores such as Postgres or Redis.
+- `recover()` takes an OS-level lock per journal, so two recoveries can't undo the same step
+  twice; a second one raises `JournalBusy`. File journal writes from several processes are
+  serialized with a file lock.
+- Dead letters: failed undos, crashes during a step and permanent steps with an unknown outcome
+  stay recorded until a person resolves them. `dead_letters()` lists them, `acknowledge()`
+  resolves them, and `recover(..., on_dead_letter=)` reports each new one once.
+- `compact()` removes settled transactions so the journal doesn't grow forever.
+- Local plan repair in `parse_plan()` before asking the model again: tool and argument names
+  that differ only in case or separators, values whose type plainly differs from the schema,
+  Python-style literals and doubly-encoded `args_json`. Each repair is logged and can be
+  collected with `repairs=[]`; `repair=False` keeps parsing strict.
+
+### Changed
+- The library logs to the standard `logging` module (logger `"rubicon"`) instead of printing.
+  `log=` defaults to `None`; pass `log=print` to print progress as before.
+- `recover()` no longer returns an empty report for a transaction it had nothing to do for.
+
+### Fixed
+- A failed undo could be lost: a second rollback (for example `with Transaction()` exiting after
+  a failed `commit()` inside it) or a later commit wrote "finished", so `recover()` never retried
+  the undo. Failed undos now stay owed until they succeed or are acknowledged.
+- A sync tool's retry backoff blocked the event loop inside `arun()`; it now waits with
+  `asyncio.sleep` except when sync code drives the call directly.
+- The confirmation showed unresolved `$step` references for a permanent step that waits on
+  another permanent step; everything already known is resolved now.
+- The demo prints a clear message instead of a traceback when the planner fails (for example
+  when the API quota is used up).
+
 ## 0.6.0
 
 ### Fixed

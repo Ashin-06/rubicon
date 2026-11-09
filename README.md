@@ -73,13 +73,18 @@ execution loop. Rubicon does.
 - `Transaction` for agents that call tools one at a time: undoable calls run, permanent calls are
   dry-run and held until commit.
 - Parallel execution of independent undoable steps.
-- Structured events for logging and tracing, and a crash-safe journal with `recover()`.
+- Crash-safe journal with `recover()`: a JSON-lines file, SQLite (several processes), or your own
+  store such as Postgres or Redis. One recovery at a time per journal, enforced with an OS lock.
+- Dead letters: every step Rubicon can't fix by itself stays recorded until a person resolves it,
+  with a callback to push it to your alerting.
+- Structured events and standard `logging` (logger `"rubicon"`); the library never prints.
 - Per-tool retries and timeouts.
 - Sync and async: tools, undo, check and confirm functions can be either.
 - MCP adapter: loads every tool from an MCP server (SDK 1.x and 2.x, all pages), gives each a real
   Python signature, and labels it conservatively from its annotations.
 - Model-agnostic planning: Gemini, Claude, any OpenAI-compatible API, or your own model through
-  `planning_request()` and `parse_plan()`. A rejected plan goes back to the model for a fix.
+  `planning_request()` and `parse_plan()`. Small mistakes in a plan are repaired locally; a plan
+  that is still wrong goes back to the model for a fix.
 - Separate registries, so several agents with different tools can share one process.
 
 ## Install
@@ -293,10 +298,20 @@ agent("...", planner=partial(plan_with_openai, model="llama3.3",          # Olla
 - Override the default models with `GEMINI_MODEL` and `CLAUDE_MODEL` (environment or `.env`), or
   pass `model=`. The variables are read each time a planner runs, so loading a `.env` after
   importing works too.
-- If a plan is rejected (bad JSON, unknown tool, wrong argument names, bad ids), `agent()` sends
-  the model its previous plan and the error, and asks for a corrected plan. `attempts=2` by
-  default. A final rejection raises `PlanRejected`, a `ValueError` whose `text` is what the model
-  wrote.
+- Before rejecting a plan, `parse_plan()` fixes small mistakes locally when there is exactly one
+  right answer, so they cost no extra model call:
+  - a tool or argument name that differs only in case or separators (`Hold_Seat`, `flightNumber`
+    for `flight_number`), when exactly one tool or parameter matches,
+  - a value whose type plainly differs from the schema (`"2"` for an integer, `101` for a string,
+    `"true"` for a boolean),
+  - Python-style output (single quotes, `True`, `None`) and doubly-encoded `args_json`.
+
+  References (`"$step..."`) are never changed, and nothing ambiguous is guessed. Every repair is
+  logged; pass `repairs=[]` to collect them, or `repair=False` for strict parsing.
+- If a plan is still rejected (bad JSON, unknown tool, wrong argument names, bad ids), `agent()`
+  sends the model its previous plan and the error, and asks for a corrected plan. `attempts=2`
+  by default. A final rejection raises `PlanRejected`, a `ValueError` whose `text` is what the
+  model wrote.
 - `plan_with_openai` sends a strict JSON Schema by default. Use `json_mode="object"` for servers
   that only have a JSON mode, and `json_mode="none"` for servers with neither.
 - Answers wrapped in code fences or surrounded by text are handled, as are bare lists of steps
@@ -336,10 +351,10 @@ recover("rubicon.jsonl")            # after a restart: undo what a crash left ha
   "duration_ms": 12.3, "tx": "...", "time": ...}`. Events: `step_started`, `step_done`,
   `check_passed`, `gate_confirmed`, `gate_declined`, `step_committed`, `step_undone`,
   `undo_failed`. Forward them to your logger or tracing system. If your `on_event` or `log`
-  callback raises, the error is written to stderr and execution carries on unchanged.
-- `journal=` appends one JSON line per step (flushed to disk) with the arguments and result
-  needed to undo it. If the process is killed, `recover()` undoes the steps of every unfinished
-  transaction since its last commit, using the same tools.
+  callback raises, the error is logged as a warning and execution carries on unchanged.
+- `journal=` records every step durably with the arguments and result needed to undo it. If the
+  process is killed, `recover()` undoes the steps of every unfinished transaction since its last
+  commit, using the same tools.
 - Recovery journals each undo as it happens, so if recovery itself is interrupted, running it
   again never undoes anything twice. A transaction is marked finished only when every undo
   succeeded; anything in a report's `undo_failed` (for example because a service was down) is
@@ -356,7 +371,58 @@ recover("rubicon.jsonl")            # after a restart: undo what a crash left ha
   that stage.
 
 Each report is `{"tx", "undone", "undo_failed", "committed", "uncertain", "needs_attention",
-"kept"}`.
+"kept"}`. Only one `recover()` runs per journal at a time; a second one raises `JournalBusy`
+instead of undoing the same step twice.
+
+### Where the journal lives
+
+```python
+from rubicon import FileJournal, SQLiteJournal
+
+run(plan, journal="rubicon.jsonl")                  # same as FileJournal("rubicon.jsonl")
+run(plan, journal=SQLiteJournal("rubicon.db"))      # many processes and threads on one machine
+run(plan, journal=MyPostgresJournal(...))           # several machines: bring your own store
+```
+
+| Journal | Use it for |
+|---|---|
+| `FileJournal(path)` | One machine. JSON lines, each write flushed and fsynced; writes from several processes are serialized with an OS file lock. |
+| `SQLiteJournal(path)` | One machine, many processes or threads. Standard library only (WAL mode, full sync). |
+| Your own object | Several machines (Postgres, Redis, a queue). It needs `append(records)` and `records()`; optionally `lock()`, a context manager held during recovery, and `drop(tx_ids)` for compaction. Records are plain JSON-serializable dicts. |
+
+### Dead letters
+
+Some steps need a person: an undo that kept failing (the service was down), a crash in the middle
+of a step, or a permanent step whose outcome is unknown. These are dead letters. They stay in the
+journal until someone resolves them, so nothing gets lost between restarts.
+
+```python
+from rubicon import dead_letters, acknowledge, recover
+
+recover(journal, on_dead_letter=page_on_call)   # called once per new dead letter
+for letter in dead_letters(journal):            # {"tx", "step", "kind", "reason", "time"}
+    ...
+acknowledge(journal, tx, step)    # that step is handled; Rubicon won't undo it
+acknowledge(journal, tx)          # the whole transaction is handled as it is
+```
+
+- `kind` is `"undo_failed"`, `"uncertain"` (crash during an undoable step) or
+  `"in_flight_permanent"` (crash during a permanent step).
+- A failed undo is retried by every `recover()` run until it succeeds or is acknowledged.
+- For a crash during a permanent step, acknowledge just that step if it did not happen, and the
+  next `recover()` undoes the steps it was keeping; acknowledge the whole transaction if it did.
+
+### Keeping the journal small
+
+`compact(journal)` removes settled transactions and keeps everything that is unfinished, owes an
+undo or has an unresolved dead letter. Run it on a schedule or at startup. With `FileJournal`,
+compaction rewrites the file atomically while writers wait for its lock.
+
+### Logging
+
+The library logs to the standard `logging` module under the name `"rubicon"` and never prints:
+progress at INFO, problems at WARNING. Pass `log=print` (or any function) to `run()`,
+`Transaction()` or `agent()` to send progress messages somewhere else.
 
 ## Async
 
@@ -408,9 +474,14 @@ OPENAI_MODEL=llama3.3 OPENAI_BASE_URL=http://localhost:11434/v1 python demo.py o
 |---|---|
 | `tool(fn=None, *, undo=None, check=None, name=None, registry=None, retries=0, undo_retries=2, timeout=None)` | Register a tool. See [Tools](#tools-undo-checks-previews-retries). |
 | `NOOP` | Undo function for read-only tools. |
-| `run(plan, registry=None, confirm=None, log=print, *, parallel=False, on_event=None, journal=None)`, `arun(...)` | Run a plan and return `{step_id: result}`. |
-| `Transaction(registry=None, confirm=None, log=print, *, on_event=None, journal=None)` | Guard an agent loop. Methods: `call`/`acall`, `commit`/`acommit`, `rollback`/`arollback`, `wrap(name)`, `wrap_all()`. Attributes: `results`, `committed`, `undone`, `undo_failed`. Works as a sync or async context manager. |
-| `recover(journal, registry=None, log=print)`, `arecover(...)` | Undo transactions a crash left unfinished. Returns one report per transaction (see [crash recovery](#parallel-steps-events-and-crash-recovery)). Safe to run repeatedly. |
+| `run(plan, registry=None, confirm=None, log=None, *, parallel=False, on_event=None, journal=None)`, `arun(...)` | Run a plan and return `{step_id: result}`. |
+| `Transaction(registry=None, confirm=None, log=None, *, on_event=None, journal=None)` | Guard an agent loop. Methods: `call`/`acall`, `commit`/`acommit`, `rollback`/`arollback`, `wrap(name)`, `wrap_all()`. Attributes: `results`, `committed`, `undone`, `undo_failed`. Works as a sync or async context manager. |
+| `recover(journal, registry=None, log=None, *, on_dead_letter=None)`, `arecover(...)` | Undo transactions a crash left unfinished. Returns one report per transaction (see [crash recovery](#parallel-steps-events-and-crash-recovery)). Safe to run repeatedly. |
+| `dead_letters(journal)` | Steps that need a person, until resolved. |
+| `acknowledge(journal, tx, step=None, note="")` | Mark a dead letter (or a whole transaction) as handled. |
+| `compact(journal)` | Remove settled transactions; returns how many. |
+| `FileJournal(path)`, `SQLiteJournal(path)` | Built-in journals. `journal=` also accepts a path or your own object. |
+| `JournalBusy` | Raised when another process holds the journal's recovery lock. |
 | `order(plan, registry=None)` | Validate a plan and return the order it would run in. |
 | `tools_for_llm(registry=None)` | Tools as `{name, description, reversible, parameters}`, with JSON Schema parameters. |
 | `PlanFailed` | Raised after rollback. Attributes: `step`, `cause`, `undone`, `committed`, `not_run`, `undo_failed`, `results`. |
@@ -428,10 +499,10 @@ OPENAI_MODEL=llama3.3 OPENAI_BASE_URL=http://localhost:11434/v1 python demo.py o
 
 | Name | Description |
 |---|---|
-| `agent(goal, planner=plan_with_gemini, client=None, registry=None, confirm=ask_human, log=print, *, attempts=2, **run_kwargs)`, `aagent(...)` | Plan with a model (retrying rejected plans with the error), then run the plan safely. |
+| `agent(goal, planner=plan_with_gemini, client=None, registry=None, confirm=ask_human, log=None, *, attempts=2, **run_kwargs)`, `aagent(...)` | Plan with a model (repairing small mistakes, retrying rejected plans with the error), then run the plan safely. |
 | `plan_with_gemini`, `plan_with_claude`, `plan_with_openai` | Turn a goal into a validated plan. Signature `(goal, client=None, registry=None, ...)`; pass `client=` to reuse or customise an SDK client. |
 | `planning_request(goal, registry=None)` | `{"system", "prompt", "schema"}` for any model. |
-| `parse_plan(text, registry=None)` | Turn model output into a validated plan. |
+| `parse_plan(text, registry=None, *, repair=True, repairs=None)` | Turn model output into a validated plan, repairing small unambiguous mistakes first. |
 | `plan_schema(registry=None)` | The plan's JSON Schema. |
 | `PlanRejected` | `ValueError` raised for a plan that fails parsing or validation; `.text` is the model's output. |
 | `GEMINI_MODEL`, `CLAUDE_MODEL` | Default models, overridable with environment variables of the same name. |
@@ -453,7 +524,12 @@ OPENAI_MODEL=llama3.3 OPENAI_BASE_URL=http://localhost:11434/v1 python demo.py o
 - Timeouts apply to async functions. A sync function can't be interrupted safely, so give slow
   sync tools their own timeouts.
 - Without `journal=`, rollback happens in-process only, and a hard kill between steps can't be
-  unwound. With it, run `recover()` on startup.
+  unwound. With it, run `recover()` on startup and alert on `dead_letters()`.
+- The built-in journals cover one machine. Across machines, use a shared store through your own
+  journal object, and give it a `lock()` that works across machines if more than one of them may
+  run `recover()`.
+- A sync undo that hangs can't be interrupted. Give remote calls their own timeouts, or make the
+  undo async so `timeout=` applies.
 - Keep keys out of the repo. `.env` is git-ignored; `.env.example` is the template.
 
 ## Development
