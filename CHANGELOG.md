@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+- `"$step.key"` and `"$step.list.0"` references pick a field or list item out of a step's result.
+  A missing field is an error for whole-value references and is left as written inside text.
+
+### Fixed
+- `@tool` on a callable without `__name__` (such as `functools.partial`) now asks for `name=`
+  instead of failing with an AttributeError.
+- `tools_for_llm()` no longer fails on tools whose signature can't be inspected.
+- `plan_with_gemini` retries rate limits and temporary overloads (429/5xx) instead of failing on
+  the first one, matching the Anthropic and OpenAI SDKs.
+- `plan_with_openai` no longer rejects valid plans from servers that report a normal finish as
+  something other than `"stop"`.
+- Packaging uses an SPDX license expression, so new setuptools versions build without warnings.
+
 ## 0.2.0
 
 ### Added
@@ -13,7 +29,7 @@
 - `registry=` everywhere for isolated tool sets; `@tool` without arguments; `name=` override.
 - JSON Schema parameters for local tools, inferred from type hints.
 - `PlanFailed.undo_failed` and `PlanFailed.results`.
-- CI on Python 3.10–3.13, Linux/Windows/macOS, MCP SDK 1.x and 2.x.
+- CI on Python 3.10 to 3.13, Linux/Windows/macOS, MCP SDK 1.x and 2.x.
 
 ### Fixed
 - MCP adapter failed on MCP SDK 2.x (renamed result and annotation fields).
