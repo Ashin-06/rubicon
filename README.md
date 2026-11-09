@@ -26,10 +26,13 @@ and any agent loop (whole plans, or step-by-step agents through `Transaction`).
 - [Features](#features)
 - [Install](#install)
 - [Quick start](#quick-start)
+- [What happens when something fails](#what-happens-when-something-fails)
 - [Two ways to use it](#two-ways-to-use-it)
 - [Plan format](#plan-format)
+- [Tools: undo, checks, previews, retries](#tools-undo-checks-previews-retries)
 - [MCP servers](#mcp-servers)
 - [Let a model write the plan](#let-a-model-write-the-plan)
+- [Parallel steps, events and crash recovery](#parallel-steps-events-and-crash-recovery)
 - [Async](#async)
 - [Multiple agents in one process](#multiple-agents-in-one-process)
 - [Live demo](#live-demo)
@@ -51,24 +54,32 @@ execution loop. Rubicon does.
 | Steps run in the order the model wrote them | Undoable steps run first, permanent steps last, dependencies respected |
 | A failure halfway leaves half-done work | Steps that already ran are undone in reverse order |
 | Ctrl+C or a cancelled task leaves a mess | Interruptions roll back too, then propagate |
+| A wrong argument name is found when the call fails | Every step's arguments are checked against the tool before anything runs |
 | Validation happens when the permanent call fails | Every permanent step is dry-run before anything permanent happens |
-| Approval per call, or none | One approval for all permanent actions |
+| Approval per call, or none | One approval for all permanent actions, with a preview of each |
 | The model can't see which tools are dangerous | Reversibility is part of the tool list the model plans against |
 
 ## Features
 
 - Zero-dependency core: `rubicon.py` uses only the Python 3.10+ standard library.
 - Safe ordering: a topological sort that prefers undoable steps and never breaks a dependency.
-- Dry runs before commit: per-tool `check` functions run before the point of no return.
+- Plans are checked before anything runs: unknown tools, bad ids, arguments that don't fit the
+  tool, missing references, cycles.
+- Dry runs before commit, with an optional human-readable preview for the confirmation.
 - Rollback on anything: errors, a declined confirmation, `KeyboardInterrupt`, task cancellation.
-  If an undo fails, it is reported and unwinding carries on.
+  Failed undos are retried, then reported, and unwinding carries on.
+- Partial commits handled correctly: undoable steps that a committed permanent step relies on are
+  never undone.
 - `Transaction` for agents that call tools one at a time: undoable calls run, permanent calls are
   dry-run and held until commit.
+- Parallel execution of independent undoable steps.
+- Structured events for logging and tracing, and a crash-safe journal with `recover()`.
+- Per-tool retries and timeouts.
 - Sync and async: tools, undo, check and confirm functions can be either.
-- MCP adapter: loads every tool from an MCP server (SDK 1.x and 2.x, all pages) and labels it
-  conservatively from its annotations.
+- MCP adapter: loads every tool from an MCP server (SDK 1.x and 2.x, all pages), gives each a real
+  Python signature, and labels it conservatively from its annotations.
 - Model-agnostic planning: Gemini, Claude, any OpenAI-compatible API, or your own model through
-  `planning_request()` and `parse_plan()`. Model output is validated before anything runs.
+  `planning_request()` and `parse_plan()`. A rejected plan goes back to the model for a fix.
 - Separate registries, so several agents with different tools can share one process.
 
 ## Install
@@ -79,7 +90,8 @@ cd rubicon
 pip install -e ".[all]"
 ```
 
-Extras: `mcp`, `gemini`, `claude`, `openai`, or `all`. The core needs none of them.
+Extras: `mcp`, `gemini`, `claude`, `openai`, `all`, and `dev` (pytest). The core needs none of
+them.
 
 ## Quick start
 
@@ -111,6 +123,23 @@ fails or the answer is no, the held seat is released.
 `@tool` with no arguments registers a permanent tool. Without `confirm`, commits are approved
 automatically, so pass one whenever a person should approve.
 
+## What happens when something fails
+
+| When it fails | What Rubicon does |
+|---|---|
+| A step before any permanent action | Undoes every step that ran, newest first |
+| A dry run, or the confirmation is declined | Same: nothing permanent has happened, so everything is undone |
+| A permanent step, after another permanent step already committed | Keeps the steps the committed one relied on (undoing them would leave things worse), undoes only steps that ran after the last commit, and lists the permanent steps that never ran |
+| Ctrl+C or task cancellation | Undoes what it can, then lets the interruption through |
+| An undo itself | Retries it, then reports it in `PlanFailed.undo_failed` and keeps unwinding |
+
+Every failure raises `PlanFailed` with `step`, `cause`, `undone`, `committed`, `not_run`,
+`undo_failed` and `results`.
+
+For example: hold seat AI101, cancel booking OLD1, then the email fails. OLD1 is already gone, so
+releasing the AI101 seat would leave the user with no flight at all. Rubicon keeps the seat,
+reports `committed=["cancel"]` and `not_run=["mail"]`, and lets you retry the email.
+
 ## Two ways to use it
 
 ### 1. Whole plans: `run` and `arun`
@@ -124,9 +153,11 @@ Most agent frameworks call tools one at a time and decide the next call from the
 
 - Undoable tools run immediately.
 - Permanent tools are dry-run immediately, so the agent sees a failed check and can react. Then
-  they are held, and the agent gets a `"Scheduled ..."` message instead of a result.
+  they are held, and the agent gets a `"Scheduled ..."` message (with the preview, if any)
+  instead of a result.
 - On a clean exit, the held actions are confirmed once and run.
 - On any exception, every undoable call is rolled back and the held actions are dropped.
+  `tx.undone` and `tx.undo_failed` say what happened.
 
 ```python
 from rubicon import Transaction
@@ -137,10 +168,11 @@ with Transaction(confirm=ask_human) as tx:
 # commits here; an exception inside the block rolls everything back
 ```
 
-Wrapped tools keep their name, docstring and signature. Pass them wherever your framework accepts
-plain Python functions, or wrap them with the framework's own tool decorator. You can also call
-tools directly with `tx.call("hold_seat", flight="AI101")` and finish with `tx.commit()` or
-`tx.rollback()`.
+Wrapped tools keep their name, docstring and signature, take positional and keyword arguments
+like the original, and are async when the tool or its check is async. Pass them wherever your
+framework accepts plain Python functions, or wrap them with the framework's own tool decorator.
+You can also call tools directly with `tx.call("hold_seat", "AI101")` and finish with
+`tx.commit()` or `tx.rollback()`.
 
 > A permanent tool's real result only exists after commit. Design the agent so it doesn't need
 > that result to choose its next step, or commit in stages.
@@ -159,22 +191,47 @@ Plans are plain JSON so a model can write them:
 
 | Field | Meaning |
 |---|---|
-| `id` | Unique step name: letters, digits, `_` or `-` |
+| `id` | Unique step name. Starts with a letter or `_`, then letters, digits, `_` or `-` |
 | `tool` | A registered tool name |
-| `args` | Keyword arguments for the tool (optional) |
+| `args` | Keyword arguments for the tool (optional). Checked against the tool's signature |
 | `after` | Step ids that must run first (optional) |
 
 References:
 
 - `"$hold"` as a whole argument passes that step's raw result.
 - `"$hold"` inside text inserts the result as text.
-- `"$hold.flight"` or `"$hold.legs.0"` picks a field or list item out of the result. As a whole
-  argument a missing field is an error; inside text it is left as written.
+- `"$hold.flight"` or `"$hold.legs.0"` picks a field or list item out of the result.
+- When the path reaches a plain value, the rest is ordinary text: with `file = {"name": "report"}`,
+  `"$file.name.txt"` becomes `"report.txt"`.
+- A key or index missing from a dict or list is treated as a typo and fails the step, so a
+  message never goes out with a dumped dictionary in it.
 - References work inside nested lists and objects and add a dependency automatically. Only real
-  step ids count, so `"$50"` stays as it is.
+  step ids count, and ids can't start with a digit, so `"$50"` or `"$1"` stay as money.
 
-A plan is rejected before anything runs if it has unknown tools, invalid or duplicate ids,
-arguments that aren't objects, references to missing steps, or dependency cycles.
+## Tools: undo, checks, previews, retries
+
+```python
+@tool(
+    undo=lambda result, args: delete_file(args["path"]),  # undo(result) or undo(result, args)
+    retries=0,          # extra attempts for the tool itself; only for tools safe to repeat
+    undo_retries=2,     # extra attempts for undo, with backoff (default 2)
+    timeout=30,         # seconds per attempt, for async functions
+)
+def put_file(path: str, content: str) -> str: ...
+
+def preview_cancel(ref):
+    booking = find(ref)                      # raise to block the commit
+    return f"Cancel {ref} ({booking.route}), fee {booking.fee}"
+
+@tool(check=preview_cancel)                  # a check's return value is shown when confirming
+def cancel_booking(ref: str): ...
+```
+
+- An undo that takes two arguments gets the call's arguments as well as its result, for tools
+  that only return `"ok"`.
+- A check takes the same parameters as its tool. Raise to block; return a string to show the
+  person confirming what will happen. `confirm(steps)` receives each step's `id`, `tool`, resolved
+  `args` and `preview`.
 
 ## MCP servers
 
@@ -198,9 +255,14 @@ async def main(session):                      # mcp ClientSession (1.x or 2.x) o
 | `readOnlyHint: true` and `trust_readonly=True` | Undoable, nothing to undo |
 | Anything else | Permanent, matching MCP's own default of assuming a tool is destructive |
 
-Names in `undo` and `checks` must exist on the server. A typo raises an error instead of quietly
-leaving a tool unprotected. Tool lists are fetched across all pages, and `prefix=` namespaces
-tools when you register several servers.
+- Each tool gets a real Python signature from its input schema (keyword-only, with type
+  annotations), so frameworks that inspect signatures see the actual parameters. Optional
+  parameters you leave out are not sent, so the server's own defaults apply.
+- Names in `undo` and `checks` must exist on the server; a typo raises an error.
+- Tool lists are fetched across all pages. `prefix=` namespaces tools (including their function
+  names) when you register several servers.
+- Text results that are JSON are parsed; `"NaN"` and `"Infinity"` stay text. Images and other
+  non-text content are returned instead of dropped.
 
 ## Let a model write the plan
 
@@ -221,9 +283,13 @@ agent("...", planner=partial(plan_with_openai, model="llama3.3",          # Olla
 | `plan_with_claude` | `claude` | `ANTHROPIC_API_KEY` | `claude-opus-5-5` |
 | `plan_with_openai` | `openai` | `OPENAI_API_KEY` (not needed for local servers) | none, pass `model=` |
 
-`plan_with_openai` sends a strict JSON Schema by default. Use `json_mode="object"` for servers that
-only have a JSON mode, and `json_mode="none"` for servers with neither. In that case the schema goes
-into the prompt, and code fences or extra text around the answer are tolerated.
+- If a plan is rejected (bad JSON, unknown tool, wrong argument names, bad ids), `agent()` sends
+  the error back to the model and asks for a corrected plan. `attempts=2` by default.
+- `plan_with_openai` sends a strict JSON Schema by default. Use `json_mode="object"` for servers
+  that only have a JSON mode, and `json_mode="none"` for servers with neither.
+- Answers wrapped in code fences or surrounded by text are handled, as are bare lists of steps
+  and `args` given as an object instead of `args_json`.
+- `agent()` passes `parallel=`, `on_event=` and `journal=` through to `run()`.
 
 To use any other model or framework:
 
@@ -236,8 +302,31 @@ text = my_model(req["system"], req["prompt"], json_schema=req["schema"])
 run(parse_plan(text))
 ```
 
-The model sees every registered tool with its JSON Schema parameters (from type hints, or from
-MCP) and whether it can be undone. The tool name in the schema is limited to registered tools.
+The model sees every registered tool with its JSON Schema parameters (from type hints, including
+`Optional`, `Literal`, enums and typed lists, or from MCP) and whether it can be undone.
+
+## Parallel steps, events and crash recovery
+
+```python
+run(plan, parallel=True)            # independent undoable steps run at the same time
+run(plan, on_event=print)           # structured events
+run(plan, journal="rubicon.jsonl")  # crash-safe log
+
+from rubicon import recover
+recover("rubicon.jsonl")            # after a restart: undo what a crash left half-done
+```
+
+- `parallel=True` runs undoable steps in waves of steps that don't depend on each other. If one
+  fails, the others in its wave are cancelled and everything completed is undone. Permanent
+  steps always run one at a time, in order.
+- `on_event` receives dicts such as `{"event": "step_done", "step": "hold", "tool": "hold_seat",
+  "duration_ms": 12.3, "tx": "...", "time": ...}`. Events: `step_started`, `step_done`,
+  `check_passed`, `gate_confirmed`, `gate_declined`, `step_committed`, `step_undone`,
+  `undo_failed`. Forward them to your logger or tracing system.
+- `journal=` appends one JSON line per step (flushed to disk) with the arguments and result
+  needed to undo it. If the process is killed, `recover()` undoes the steps of every unfinished
+  transaction since its last commit, using the same tools, and marks them finished. Results and
+  arguments must be JSON-serializable to be replayed.
 
 ## Async
 
@@ -247,11 +336,15 @@ Everything has an async form, and tools, undo, check and confirm functions can b
 |---|---|
 | `run(plan)` | `await arun(plan)` |
 | `agent(goal)` | `await aagent(goal)` |
+| `recover(path)` | `await arecover(path)` |
 | `with Transaction() as tx` | `async with Transaction() as tx` |
 | `tx.call`, `tx.commit`, `tx.rollback` | `await tx.acall`, `tx.acommit`, `tx.arollback` |
 
-Calling a sync entry point from inside a running event loop raises an error that points you to the
-async form. Wrapped sync tools still work when an async framework calls them on its loop thread.
+- Calling `run()` from inside a running event loop raises an error that points you to `arun()`.
+- `tx.call()` and wrapped sync tools still work when an async framework calls them on its loop
+  thread, as long as the tool and its check are sync.
+- `aagent()` accepts sync or async planners, and runs a sync `confirm` (like the terminal prompt)
+  in a thread so it doesn't block the event loop.
 
 ## Multiple agents in one process
 
@@ -283,13 +376,14 @@ OPENAI_MODEL=llama3.3 OPENAI_BASE_URL=http://localhost:11434/v1 python demo.py o
 
 | Name | Description |
 |---|---|
-| `tool(fn=None, *, undo=None, check=None, name=None, registry=None)` | Register a tool. `undo(result)` reverses it (`None` means permanent). `check(**args)` dry-runs a permanent tool; raise to block. |
+| `tool(fn=None, *, undo=None, check=None, name=None, registry=None, retries=0, undo_retries=2, timeout=None)` | Register a tool. See [Tools](#tools-undo-checks-previews-retries). |
 | `NOOP` | Undo function for read-only tools. |
-| `run(plan, registry=None, confirm=None, log=print)`, `arun(...)` | Run a plan and return `{step_id: result}`. `confirm(steps)` gets the permanent steps with references resolved. |
-| `Transaction(registry=None, confirm=None, log=print)` | Guard an agent loop. Methods: `call`/`acall`, `commit`/`acommit`, `rollback`/`arollback`, `wrap(name)`, `wrap_all()`. Works as a sync or async context manager. |
+| `run(plan, registry=None, confirm=None, log=print, *, parallel=False, on_event=None, journal=None)`, `arun(...)` | Run a plan and return `{step_id: result}`. |
+| `Transaction(registry=None, confirm=None, log=print, *, on_event=None, journal=None)` | Guard an agent loop. Methods: `call`/`acall`, `commit`/`acommit`, `rollback`/`arollback`, `wrap(name)`, `wrap_all()`. Attributes: `results`, `committed`, `undone`, `undo_failed`. Works as a sync or async context manager. |
+| `recover(journal, registry=None, log=print)`, `arecover(...)` | Undo transactions a crash left unfinished. Returns one report per transaction. |
 | `order(plan, registry=None)` | Validate a plan and return the order it would run in. |
 | `tools_for_llm(registry=None)` | Tools as `{name, description, reversible, parameters}`, with JSON Schema parameters. |
-| `PlanFailed` | Raised after rollback. Attributes: `step`, `cause`, `undone`, `committed`, `undo_failed`, `results`. |
+| `PlanFailed` | Raised after rollback. Attributes: `step`, `cause`, `undone`, `committed`, `not_run`, `undo_failed`, `results`. |
 | `TOOLS` | The default registry. |
 
 ### `rubicon_mcp`
@@ -303,46 +397,53 @@ OPENAI_MODEL=llama3.3 OPENAI_BASE_URL=http://localhost:11434/v1 python demo.py o
 
 | Name | Description |
 |---|---|
-| `agent(goal, planner=plan_with_gemini, client=None, registry=None, confirm=ask_human, log=print)`, `aagent(...)` | Plan with a model, then run the plan safely. |
+| `agent(goal, planner=plan_with_gemini, client=None, registry=None, confirm=ask_human, log=print, *, attempts=2, **run_kwargs)`, `aagent(...)` | Plan with a model (retrying rejected plans with the error), then run the plan safely. |
 | `plan_with_gemini`, `plan_with_claude`, `plan_with_openai` | Turn a goal into a validated plan. Signature `(goal, client=None, registry=None, ...)`; pass `client=` to reuse or customise an SDK client. |
 | `planning_request(goal, registry=None)` | `{"system", "prompt", "schema"}` for any model. |
 | `parse_plan(text, registry=None)` | Turn model output into a validated plan. |
 | `plan_schema(registry=None)` | The plan's JSON Schema. |
-| `ask_human(steps)` | Terminal confirmation. Returns `False` when no terminal is attached. |
+| `ask_human(steps)` | Terminal confirmation with previews. Returns `False` when no terminal is attached. |
 
 ## Security and limitations
 
 - MCP annotations are claims, not guarantees. A malicious server could mark a destructive tool as
   read-only, so read-only tools only run before the safety gate with `trust_readonly=True`. Use it
   for servers you trust.
-- Model output is untrusted. Plans are checked for structure, but argument values are up to your
-  tools. Validate at the tool boundary and give permanent tools a `check`.
+- Model output is untrusted. Plans are checked for structure and argument names, but argument
+  values are up to your tools. Validate at the tool boundary and give permanent tools a `check`.
 - An undo is a compensation, not a time machine: it is whatever your function does, such as
-  releasing a hold or deleting a draft. If an undo fails, Rubicon keeps unwinding and lists it in
-  `PlanFailed.undo_failed`.
+  releasing a hold or deleting a draft.
 - If a permanent step needs another permanent step's output, its dry run can only happen right
   before it runs, after the point of no return. Split the plan if that matters.
-- Rollback happens in-process. A hard kill (power loss, `SIGKILL`) between steps can't be unwound,
-  so keep undoable actions cheap to clean up, for example holds that expire.
+- With `parallel=True`, a step cancelled mid-flight because a sibling failed is not undone (it
+  never reported a result). Keep undoable tools atomic.
+- Timeouts apply to async functions. A sync function can't be interrupted safely, so give slow
+  sync tools their own timeouts.
+- Without `journal=`, rollback happens in-process only, and a hard kill between steps can't be
+  unwound. With it, run `recover()` on startup.
 - Keep keys out of the repo. `.env` is git-ignored; `.env.example` is the template.
 
 ## Development
 
-Each module has its own self-check. No test framework, API keys or network are needed.
+Each module has its own self-check, and pytest runs all of them. No API keys or network needed.
 
 ```bash
-python rubicon.py        # core: ordering, validation, references, dry runs, rollback, async, Transaction
-python rubicon_mcp.py    # MCP adapter against an in-memory MCP server, plus pagination
-python rubicon_llm.py    # planners with stub clients, parsing, validation
+python rubicon.py              # core
+python rubicon_mcp.py          # MCP adapter against an in-memory MCP server
+python rubicon_llm.py          # planners with stub clients
+pip install -e ".[all,dev]"
+pytest --cov                   # everything, with coverage
 ```
 
-CI runs all three on Python 3.10 to 3.13, on Linux, Windows and macOS, against MCP SDK 1.x and 2.x.
+CI runs the core with nothing installed, then the full suite with coverage on Python 3.10 to
+3.13, on Linux, Windows and macOS, against MCP SDK 1.x and 2.x.
 
 ```
-rubicon.py        core: registry, ordering, gate, rollback, Transaction
+rubicon.py        core: registry, ordering, validation, gate, rollback, Transaction, journal
 rubicon_mcp.py    MCP adapter
 rubicon_llm.py    Gemini, Claude and OpenAI-compatible planners, plus bring-your-own-model helpers
 demo.py           live demo with fake travel tools
+tests/            pytest entry point for the self-checks
 ```
 
 Release notes are in [CHANGELOG.md](CHANGELOG.md).

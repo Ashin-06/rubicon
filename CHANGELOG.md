@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.4.0
+
+### Fixed
+- A permanent step failing after another permanent step had committed rolled back the undoable
+  steps the committed one relied on (cancel the old booking, email fails, new seat released: no
+  flight at all). Steps before a commit are now kept; only steps after the last commit are undone,
+  and `PlanFailed.not_run` lists the permanent steps that never ran.
+- Arguments are checked against each tool's signature (and its check's) before anything runs, so
+  a hallucinated or missing argument name no longer fails halfway through a plan.
+- `Transaction.wrap()` mishandled `*args`, `**kwargs`, positional-only parameters and defaults
+  (which never reached the check), and could deadlock when a sync wrapper ran on an event-loop
+  thread. Wrappers now bind calls properly, and are async when the tool or check is async.
+- MCP tools had a `(**args)` signature and an unprefixed `__name__`. They now have real
+  keyword-only signatures from their input schema, prefixed names, and optional parameters that
+  are left out instead of sent as null.
+- A typo in a `$step.field` reference inside text inserted the whole result instead of failing.
+  Paths now resolve as far as they can (`$file.name.txt` gives `report.txt`) and a missing key or
+  index is an error.
+- Step ids may no longer be purely numeric, so `"$1"` in text is never mistaken for a reference.
+- Dry runs ignored `after` dependencies, and a bad reference in a permanent step was blamed on
+  the previous step.
+- `Transaction` now records `undone` and `undo_failed`, and rollback keeps unwinding through a
+  second Ctrl+C or a cancellation instead of stopping.
+- Planner parsing: braces in trailing prose broke the JSON extraction, an empty `args_json`
+  overwrote `args`, `"after": null` and bare step lists were rejected, and empty Claude or OpenAI
+  responses raised `StopIteration` or `IndexError` instead of a clear error.
+- `aagent()` blocked the event loop on the terminal prompt and couldn't use async planners.
+- Type hints like `Optional[str]`, `Literal`, enums and `list[str]` produced empty schemas.
+- MCP text results `"NaN"` and `"Infinity"` were turned into floats; non-text content was
+  dropped.
+- `plan_with_claude` and `plan_with_openai` no longer need their SDK installed when given a client.
+- Demo: unused import removed, a clear message when `OPENAI_MODEL` is missing, and `.env.example`
+  documents every variable.
+
+### Added
+- `undo(result, args)`: an undo can receive the call's arguments, for tools that return only "ok".
+- Previews: a check's return value is shown at the confirmation and in the agent's
+  "Scheduled ..." message.
+- `parallel=True` runs independent undoable steps concurrently.
+- `on_event` structured events with timings.
+- `journal=` crash-safe log and `recover()` / `arecover()` to undo what a crash left unfinished.
+- Per-tool `retries`, `undo_retries` (default 2, with backoff) and `timeout`.
+- `agent()` and `aagent()` send a rejected plan's error back to the model for a corrected plan.
+- `__all__` in every module, a pytest suite with coverage in CI, and a CI step that runs the core
+  with nothing installed.
+
 ## 0.3.0
 
 ### Added
