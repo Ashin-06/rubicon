@@ -106,8 +106,13 @@ def _plan_like(value):
 def _pick(candidates):
     """The first candidate that looks like a plan, else the first object or array at all, so
     a stray "[1]" in the prose before the plan doesn't win."""
-    candidates = list(candidates)
-    return next((c for c in candidates if _plan_like(c)), candidates[0] if candidates else None)
+    first = None
+    for i, candidate in enumerate(candidates):  # lazily: stop at the first plan
+        if _plan_like(candidate):
+            return candidate
+        if i == 0:
+            first = candidate
+    return first
 
 
 def _starts(text):
