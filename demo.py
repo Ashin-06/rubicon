@@ -14,7 +14,7 @@ from pathlib import Path
 
 env = Path(__file__).with_name(".env")
 if env.exists():
-    for line in env.read_text().splitlines():
+    for line in env.read_text(encoding="utf-8").splitlines():
         if "=" in line and not line.lstrip().startswith("#"):
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
