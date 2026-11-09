@@ -557,7 +557,7 @@ python rubicon.py              # core
 python rubicon_mcp.py          # MCP adapter against an in-memory MCP server
 python rubicon_llm.py          # planners with stub clients
 pip install -e ".[all,dev]"
-pytest --cov                   # everything, with coverage
+pytest --cov                   # everything, with coverage (--cov needs the dev extra)
 ```
 
 ### Randomised invariant tests
@@ -565,11 +565,14 @@ pytest --cov                   # everything, with coverage
 Example tests only cover situations someone thought of, so `tests/test_fuzz.py` also generates
 random plans and agent loops with random tool failures, failing checks, declined
 confirmations, undo outages, parallel runs, and process deaths at every possible point
-(including in the middle of a recovery). After each one, a simulated operator resolves the
-dead letters and recovery runs until done. Then it checks the rules that must always hold:
+(including in the middle of a recovery). One kind of scenario also has another worker run
+`recover()`, `compact()` and `acknowledge()` on the same journal while a transaction is still
+running. After each one, a simulated operator resolves the dead letters and recovery runs until
+done. Then it checks the rules that must always hold:
 
 - an undoable step never runs after a permanent step unless it depends on it,
 - nothing a committed or completed permanent step relied on is ever undone,
+- another worker never undoes a step of a transaction that is still running,
 - everything after the last permanent step is cleaned up, by an undo or by the operator,
 - no undo runs for something that never happened,
 - failure reports (`committed`, `undone`, `undo_failed`, `not_run`) match what happened,

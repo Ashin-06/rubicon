@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.8.2
+
+### Fixed
+- A `Transaction` that committed a stage, had that stage removed by `compact()` (from another
+  worker), and then started a new stage wrote no new "begin" record, so another worker's
+  `recover()` could not tell the new stage was running and undid it. The same happened when a
+  stage ended with an owed undo that a person then acknowledged (found by the randomised tests
+  at depth, seed 3079722). Every stage after a settle now writes its own "begin" with pid and
+  host, and a transaction running in the current process is never treated as crashed.
+- `acknowledge(journal, tx, step)` marked the whole transaction as not running, even if a later
+  stage was still running, so another worker's `recover()` could undo that stage. A transaction
+  now counts as settled only when nothing else of it is open.
+- A transaction whose first step failed stayed unsettled in the journal, so it couldn't be
+  compacted, and another worker skipped it for as long as its process lived. The transaction
+  now settles itself when nothing is pending or running. (A journal-side rule for the same
+  case was tried and rejected: the randomised tests showed that a live `Transaction` can hold
+  permanent steps the journal doesn't know about yet.)
+- A recovery attempt whose undo failed now records the transaction as settled, so later
+  retries are not mistaken for a running transaction.
+
+### Added
+- Randomised tests for concurrent maintenance: another worker runs `recover()`, `compact()`
+  and `acknowledge()` on the same journal while a transaction runs, and must never undo a
+  running step.
+
 ## 0.8.1
 
 ### Added
