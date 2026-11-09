@@ -557,12 +557,13 @@ class Transaction:
         if not self._journal:
             return
         now = time.time()
-        records = [{"tx": self.id, "event": event, "time": now, **data}]
+        # every record says who runs this transaction, so recover() elsewhere can tell it is
+        # still alive even after compact() removed its earlier records
+        who = {"pid": os.getpid(), "host": _HOST}
+        records = [{"tx": self.id, "event": event, "time": now, **data, **who}]
         with self._lock:
             if not self._began:
-                # who runs this transaction, so recover() elsewhere can tell it's still alive
-                records.insert(0, {"tx": self.id, "event": "begin", "time": now, "pid": os.getpid(),
-                                   "host": _HOST})
+                records.insert(0, {"tx": self.id, "event": "begin", "time": now, **who})
             self._journal.append(records)  # state changes below only once this succeeded
             self._began = True
             if event in ("started", "done", "committed"):
@@ -604,15 +605,7 @@ class Transaction:
             r = await _attempt(t.fn, a, k, t.retries, t.timeout)
         except BaseException as e:
             self._running.discard(label)
-            try:
-                self._write("step_failed", step=label, tool=name, error=repr(e))
-            finally:
-                if not (self.done or self.pending or self._running):
-                    # nothing outstanding: settle, so the journal doesn't show it as running
-                    try:
-                        self._settle("step_failed")
-                    except BaseException:
-                        _LIVE.discard(self.id)
+            self._write("step_failed", step=label, tool=name, error=repr(e))
             raise
         self._running.discard(label)
         ms = round((time.perf_counter() - start) * 1000, 1)
@@ -652,7 +645,17 @@ class Transaction:
         a, k, view = _prepare(t.fn, args, kwargs)
         label = self._label(name)
         if t.reversible:
-            return await self._run(label, name, a, k, view, permanent=False)
+            try:
+                return await self._run(label, name, a, k, view, permanent=False)
+            except BaseException:
+                # an agent call is the one path with no rollback after a failure: if nothing is
+                # outstanding, settle, so the journal doesn't show the transaction as running
+                if not (self.done or self.pending or self._running):
+                    try:
+                        self._settle("step_failed")
+                    except BaseException:
+                        _LIVE.discard(self.id)
+                raise
         preview = await self._check(label, name, a, k, view)
         self.pending.append({"id": label, "tool": name, "args": view, "preview": preview, "call": (a, k)})
         note = f" Preview: {preview}" if preview is not None else ""
@@ -1076,9 +1079,9 @@ def _replay(records):
         if event in ("started", "done", "committed"):
             # new activity reopens a transaction that committed in stages
             tx["finished"] = tx["settled"] = False
-        if event == "begin":
+        if "pid" in rec:  # written by the Transaction itself: who runs it, most recent wins
             tx["begin"] = rec
-        elif event == "started":
+        if event == "started":
             tx["open"][step] = rec
         elif event == "done":
             tx["open"].pop(step, None)
@@ -1099,6 +1102,8 @@ def _replay(records):
         elif event == "dead_letter":
             letters[(tx_id, step)] = {"tx": tx_id, "step": step, "kind": rec.get("kind"),
                                       "reason": rec.get("reason"), "time": rec.get("time")}
+            # only recover() writes these, and only for a transaction it found not running
+            tx["settled"] = True
             if rec.get("kind") == "uncertain":  # reported; nothing more recover() can do about it
                 tx["open"].pop(step, None)
         elif event == "undone":
@@ -1106,17 +1111,20 @@ def _replay(records):
             tx["owed"].pop(step, None)
             letters.pop((tx_id, step), None)
         elif event == "resolved":
+            # never marks the transaction as not running: a person resolving an old dead letter
+            # says nothing about a later stage that may be running right now
             if step:
                 for part in ("open", "done", "owed"):
                     tx[part].pop(step, None)
                 letters.pop((tx_id, step), None)
-                if not (tx["open"] or tx["done"] or tx["owed"]):
-                    tx["settled"] = True  # that was the last open item; other stages may still run
-            else:  # the whole transaction was handled by a person
-                for part in ("open", "done", "owed"):
-                    tx[part].clear()
-                tx["finished"] = tx["settled"] = True
-                for key in [k for k in letters if k[0] == tx_id]:
+            else:
+                # the outcome of the crash was handled by a person: what was kept or in flight
+                # is settled. Undos owed from an earlier rollback are separate debts and stay
+                # until they succeed or are acknowledged one by one.
+                tx["open"].clear()
+                tx["done"].clear()
+                tx["settled"] = True
+                for key in [k for k in letters if k[0] == tx_id and k[1] not in tx["owed"]]:
                     del letters[key]
         elif event in ("settled", "finished"):  # everything before this is committed or undone
             tx["done"].clear()
@@ -1204,20 +1212,46 @@ async def arecover(journal, registry=None, log=None, *, on_dead_letter=None, inc
 
             in_flight = [s for s, r in tx["open"].items() if r.get("permanent")]
             uncertain = [s for s, r in tx["open"].items() if not r.get("permanent")]
-            to_undo = sorted([*tx["done"].values(), *tx["owed"].values()], key=lambda r: r["_pos"], reverse=True)
-            if not (in_flight or uncertain or to_undo):  # nothing left to do: close it quietly
+            newest_first = lambda recs: sorted(recs, key=lambda r: r["_pos"], reverse=True)
+            if not (in_flight or uncertain or tx["done"] or tx["owed"]):  # nothing to do: close quietly
                 j.append([_record("finished", tx_id, status="recovered")])
                 continue
             report = {"tx": tx_id, "undone": [], "undo_failed": [], "committed": tx["committed"],
                       "uncertain": uncertain, "needs_attention": in_flight, "kept": []}
+
+            async def undo_all(recs):
+                for rec in recs:
+                    t = tools.get(rec["tool"])
+                    result, args = rec.get("result"), rec.get("args", {})
+                    try:
+                        if t is None or not t.reversible:
+                            raise LookupError(f"tool {rec['tool']!r} is not registered as undoable")
+                        with_args = _takes_args(t.undo)
+                        if _has_mark(result) or (with_args and _has_mark(args)):
+                            raise ValueError("the step's result or arguments weren't JSON-serializable, "
+                                             "so they can't be replayed; undo it by hand")
+                        await _attempt(t.undo, (result, args) if with_args else (result,), {},
+                                       t.undo_retries, t.timeout)
+                        report["undone"].append(rec["step"])
+                        j.append([_record("undone", tx_id, step=rec["step"], by="recover")])
+                        letters.pop((tx_id, rec["step"]), None)
+                    except Exception as e:
+                        report["undo_failed"].append(rec["step"])
+                        j.append([_record("undo_failed", tx_id, step=rec["step"], error=repr(e))])
+                        dead_letter(rec["step"], "undo_failed", repr(e), write=False)
+                        say(f"recover: undo of {rec['step']} failed: {e!r}")
+
             if in_flight:
-                report["kept"] = [r["step"] for r in reversed(to_undo)]
+                # keep what the in-flight permanent step may rely on: the steps since the last
+                # commit. Undos owed from an earlier rollback don't depend on it: retry them.
+                report["kept"] = [r["step"] for r in sorted(tx["done"].values(), key=lambda r: r["_pos"])]
                 say(f"recover: transaction {tx_id} stopped during permanent step(s) {in_flight}; it may "
                     f"or may not have happened, so {report['kept']} were kept. Check by hand, then "
                     f"call acknowledge().")
                 for s in in_flight:
                     dead_letter(s, "in_flight_permanent", "the process stopped while this permanent step "
                                 "was running; it may or may not have happened")
+                await undo_all(newest_first(tx["owed"].values()))
                 reports.append(report)
                 continue
             for s in uncertain:
@@ -1226,25 +1260,7 @@ async def arecover(journal, registry=None, log=None, *, on_dead_letter=None, inc
             if uncertain:
                 say(f"recover: step(s) {uncertain} of {tx_id} started but never reported a result; "
                     f"they may have happened and can't be undone automatically.")
-            for rec in to_undo:
-                t = tools.get(rec["tool"])
-                result, args = rec.get("result"), rec.get("args", {})
-                try:
-                    if t is None or not t.reversible:
-                        raise LookupError(f"tool {rec['tool']!r} is not registered as undoable")
-                    with_args = _takes_args(t.undo)
-                    if _has_mark(result) or (with_args and _has_mark(args)):
-                        raise ValueError("the step's result or arguments weren't JSON-serializable, so "
-                                         "they can't be replayed; undo it by hand")
-                    await _attempt(t.undo, (result, args) if with_args else (result,), {}, t.undo_retries, t.timeout)
-                    report["undone"].append(rec["step"])
-                    j.append([_record("undone", tx_id, step=rec["step"], by="recover")])
-                    letters.pop((tx_id, rec["step"]), None)
-                except Exception as e:
-                    report["undo_failed"].append(rec["step"])
-                    j.append([_record("undo_failed", tx_id, step=rec["step"], error=repr(e))])
-                    dead_letter(rec["step"], "undo_failed", repr(e), write=False)
-                    say(f"recover: undo of {rec['step']} failed: {e!r}")
+            await undo_all(newest_first([*tx["done"].values(), *tx["owed"].values()]))
             # "settled" when an undo is still owed: recovery handled it, nothing runs, retry later
             j.append([_record("settled" if report["undo_failed"] else "finished", tx_id, status="recovered")])
             reports.append(report)
@@ -2140,7 +2156,7 @@ if __name__ == "__main__":
             self.j.append(records)
 
         def records(self):
-            return [{**r, "pid": os.getppid()} if r.get("event") == "begin" else r for r in self.j.records()]
+            return [{**r, "pid": os.getppid()} if "pid" in r else r for r in self.j.records()]
 
         def drop(self, tx_ids):
             self.j.drop(tx_ids)
@@ -2220,6 +2236,63 @@ if __name__ == "__main__":
     with from_other_process(path23) as other:
         assert recover(other, registry=stage, log=quiet) == [] and stage_undone == []
     tx.rollback()
+
+    # ...nor when an earlier stage's owed undo is acknowledged and compacted: the records left
+    # must still say who runs the transaction
+    path25 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    tx = Transaction(registry=stage, journal=path25, log=quiet)
+    tx.call("sc")
+    tx.rollback()  # owed
+    tx.call("sp")  # pending
+    expect(ZeroDivisionError, tx.call, "sbroken")
+    with from_other_process(path25) as other:
+        acknowledge(other, tx.id, "sc-1")
+        compact(other)
+    tx.call("sb")
+    stage_undone.clear()
+    with from_other_process(path25) as other:
+        assert recover(other, registry=stage, log=quiet) == [] and stage_undone == []
+    tx.rollback()
+
+    # a crash inside a permanent step does not hold back an earlier stage's owed undo, and
+    # acknowledging the whole transaction afterwards does not wipe it
+    path26 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    FileJournal(path26).append([
+        {"tx": "T", "event": "begin"},
+        {"tx": "T", "event": "started", "step": "sc-1", "tool": "sc", "permanent": False},
+        {"tx": "T", "event": "done", "step": "sc-1", "tool": "sc", "args": {}, "result": "c"},
+        {"tx": "T", "event": "undo_failed", "step": "sc-1", "error": "down"},
+        {"tx": "T", "event": "settled", "status": "rolled_back"},
+        {"tx": "T", "event": "started", "step": "sp-2", "tool": "sp", "permanent": True}])
+    owed_reg, owed_calls = {}, []
+    tool(lambda: "c", name="sc", undo=owed_calls.append, registry=owed_reg)
+    tool(lambda: "p", name="sp", registry=owed_reg)
+    first = recover(path26, registry=owed_reg, log=quiet)
+    assert owed_calls == ["c"] and first[0]["undone"] == ["sc-1"], first  # retried, not held
+    assert first[0]["needs_attention"] == ["sp-2"]
+    assert [d["kind"] for d in dead_letters(path26)] == ["in_flight_permanent"]
+    path27 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    FileJournal(path27).append(FileJournal(path26).records()[:6])  # the same, with the undo still down
+    down_reg = {}
+    tool(lambda: "c", name="sc", undo=lambda r: 1 / 0, undo_retries=0, registry=down_reg)
+    tool(lambda: "p", name="sp", registry=down_reg)
+    recover(path27, registry=down_reg, log=quiet)
+    assert sorted(d["kind"] for d in dead_letters(path27)) == ["in_flight_permanent", "undo_failed"]
+    acknowledge(path27, "T", note="the permanent step went through")
+    assert [d["kind"] for d in dead_letters(path27)] == ["undo_failed"]  # the owed undo survives
+    owed_calls.clear()
+    recover(path27, registry=owed_reg, log=quiet)
+    assert owed_calls == ["c"] and not dead_letters(path27)
+
+    # a failed permanent step after an earlier commit leaves one settle, from the plan's end
+    path28 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    seq = {}
+    tool(lambda: "1", name="q1", registry=seq)
+    tool(lambda: 1 / 0, name="q2", registry=seq)
+    expect(PlanFailed, run, [{"id": "a", "tool": "q1"}, {"id": "b", "tool": "q2", "after": ["a"]}],
+           registry=seq, journal=path28, log=quiet)
+    settles = [r.get("status") for r in FileJournal(path28).records() if r["event"] in ("finished", "settled")]
+    assert "step_failed" not in settles, settles
 
     # --- settle records: one per settle, none for an empty transaction ---
     path14 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
