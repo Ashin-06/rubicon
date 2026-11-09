@@ -19,12 +19,17 @@ still need confirmation. agent() sends a rejected plan's error back to the model
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import inspect
 import json
+import logging
 import os
+import re
 
-from rubicon import TOOLS, arun, order, run, tools_for_llm
+from rubicon import TOOLS, _schema, arun, order, run, tools_for_llm
+
+_logger = logging.getLogger("rubicon")
 
 __all__ = ["CLAUDE_MODEL", "GEMINI_MODEL", "PlanRejected", "SYSTEM", "aagent", "agent", "ask_human",
            "parse_plan", "plan_schema", "plan_with_claude", "plan_with_gemini", "plan_with_openai",
@@ -89,8 +94,26 @@ def planning_request(goal, registry=None):
     return {"system": SYSTEM, "prompt": f"Tools:\n{tools}\n\nGoal: {goal}", "schema": plan_schema(registry)}
 
 
-def _loads(text):
-    """Parse the first JSON object or array in the text, ignoring fences and prose around it."""
+def _literal(text):
+    """Python-style dict/list output (single quotes, True/None) from models without a JSON mode.
+    ast.literal_eval only reads literals; it never runs code."""
+    start = next((i for i, ch in enumerate(text) if ch in "{["), None)
+    if start is None:
+        return None
+    for end in range(len(text), start, -1):
+        if text[end - 1] in "}]":
+            try:
+                value = ast.literal_eval(text[start:end])
+            except (ValueError, SyntaxError, MemoryError, RecursionError, TypeError):
+                continue
+            if isinstance(value, (dict, list)):
+                return value
+    return None
+
+
+def _loads(text, repairs=None):
+    """Parse the first JSON object or array in the text, ignoring fences and prose around it.
+    With a repairs list, Python-style literals are accepted too (and noted in the list)."""
     t = text.strip()
     try:
         return json.loads(t)
@@ -103,23 +126,105 @@ def _loads(text):
                 return decoder.raw_decode(t, i)[0]
             except ValueError:
                 continue
+    if repairs is not None:
+        value = _literal(t)
+        if value is not None:
+            repairs.append("read Python-style literal output as JSON")
+            return value
     raise ValueError(f"model output is not JSON: {text[:200]!r}")
 
 
-def parse_plan(text, registry=None):
+def _norm(name):
+    return re.sub(r"[^a-z0-9]", "", name.lower()) if isinstance(name, str) else None
+
+
+def _unique(name, options):
+    """The single option `name` can mean, ignoring case and _ - spaces; None if zero or several."""
+    key = _norm(name)
+    matches = [o for o in options if _norm(o) == key]
+    return matches[0] if key and len(matches) == 1 else None
+
+
+_INT = re.compile(r"[+-]?\d+")
+
+
+def _coerce(value, prop):
+    """Fix a value whose JSON type plainly differs from the schema's. References are untouched."""
+    kind = prop.get("type") if isinstance(prop, dict) else None
+    if isinstance(value, str) and value.lstrip().startswith("$"):
+        return value
+    if kind == "string" and isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    if kind == "integer":
+        if isinstance(value, str) and _INT.fullmatch(value.strip()):
+            return int(value.strip())
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+    if kind == "number" and isinstance(value, str):
+        text = value.strip()
+        if _INT.fullmatch(text):
+            return int(text)
+        try:
+            number = float(text)
+        except ValueError:
+            return value
+        return number if number == number and abs(number) != float("inf") else value  # not NaN/inf
+    if kind == "boolean" and isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    return value
+
+
+def _repair(plan, tools, repairs):
+    """Deterministic fixes for small, unambiguous mistakes, so the model isn't asked again."""
+    for step in plan:
+        name = step["tool"]
+        if isinstance(name, str) and name not in tools:
+            fixed = _unique(name, tools)
+            if fixed:
+                repairs.append(f"step {step['id']!r}: tool {name!r} -> {fixed!r}")
+                step["tool"] = name = fixed
+        if not isinstance(name, str) or name not in tools or not isinstance(step["args"], dict):
+            continue
+        props = (_schema(tools[name].fn) or {}).get("properties") or {}
+        if not props:
+            continue
+        args = step["args"]
+        for key in [k for k in args if k not in props]:
+            fixed = _unique(key, [p for p in props if p not in args])
+            if fixed:
+                repairs.append(f"step {step['id']!r}: argument {key!r} -> {fixed!r}")
+                args[fixed] = args.pop(key)
+        for key, value in list(args.items()):
+            new = _coerce(value, props.get(key))
+            if type(new) is not type(value) or new != value:
+                repairs.append(f"step {step['id']!r}: {key}={value!r} -> {new!r}")
+                args[key] = new
+
+
+def parse_plan(text, registry=None, *, repair=True, repairs=None):
     """Model output -> validated plan.
 
     Accepts {"steps": [...]} or a bare [...] list, with "args_json" (a JSON string) or "args".
-    Raises PlanRejected (a ValueError) carrying the model's text.
+    With repair=True, small unambiguous mistakes are fixed locally before validation: a tool or
+    argument name that differs only in case or separators, a number sent as a string (or the
+    reverse) where the schema says otherwise, "true"/"false" for booleans, doubly-encoded
+    args_json and Python-style literals. Each change is logged, and appended to `repairs` if you
+    pass a list. Raises PlanRejected (a ValueError) carrying the model's text.
     """
+    changes = [] if repair else None
     try:
-        return _parse_plan(text, registry)
+        return _parse_plan(text, registry, changes)
     except ValueError as e:  # includes json.JSONDecodeError
         raise PlanRejected(str(e), text) from e
+    finally:
+        for change in changes or []:
+            _logger.info("repaired plan: %s", change)
+        if repairs is not None:
+            repairs.extend(changes or [])
 
 
-def _parse_plan(text, registry):
-    data = _loads(text)
+def _parse_plan(text, registry, repairs):
+    data = _loads(text, repairs)
     steps = data if isinstance(data, list) else data.get("steps") if isinstance(data, dict) else None
     if not isinstance(steps, list):
         raise ValueError('model output has no "steps" list')
@@ -129,11 +234,25 @@ def _parse_plan(text, registry):
             raise ValueError(f"step is not an object: {s!r}")
         args, raw = s.get("args"), s.get("args_json")
         if isinstance(raw, str) and raw.strip():
-            args = json.loads(raw)
+            try:
+                args = json.loads(raw)
+            except ValueError:
+                args = _literal(raw) if repairs is not None else None
+                if args is None:
+                    raise
+                repairs.append(f"step {s.get('id')!r}: read Python-style args_json")
+            if isinstance(args, str) and repairs is not None:  # JSON encoded twice
+                try:
+                    args = json.loads(args)
+                    repairs.append(f"step {s.get('id')!r}: decoded doubly-encoded args_json")
+                except ValueError:
+                    pass
         elif isinstance(raw, dict):
             args = raw
         plan.append({"id": s.get("id"), "tool": s.get("tool"),
                      "args": {} if args is None else args, "after": s.get("after") or []})
+    if repairs is not None:
+        _repair(plan, _registry(registry), repairs)
     order(plan, registry)  # full validation before anything can run
     return plan
 
@@ -253,7 +372,7 @@ def _check_attempts(attempts):
         raise ValueError(f"attempts must be a whole number of at least 1, got {attempts!r}")
 
 
-def agent(goal, planner=plan_with_gemini, client=None, registry=None, confirm=ask_human, log=print,
+def agent(goal, planner=plan_with_gemini, client=None, registry=None, confirm=ask_human, log=None,
           *, attempts=2, **run_kwargs):
     """Plan with a model, then run the plan safely.
 
@@ -274,7 +393,7 @@ def agent(goal, planner=plan_with_gemini, client=None, registry=None, confirm=as
     return run(plan, registry, confirm, log, **run_kwargs)
 
 
-async def aagent(goal, planner=plan_with_gemini, client=None, registry=None, confirm=ask_human, log=print,
+async def aagent(goal, planner=plan_with_gemini, client=None, registry=None, confirm=ask_human, log=None,
                  *, attempts=2, **run_kwargs):
     """Async agent(): use inside event loops and with async (e.g. MCP) tools.
 
@@ -449,6 +568,50 @@ if __name__ == "__main__":
                        '"args_json": "", "after": null}]}', reg)
     assert loose == [{"id": "s", "tool": "search", "args": {"route": "x"}, "after": []}]
     assert parse_plan('[{"id": "s", "tool": "search", "args": {"route": "x"}, "args_json": null}]', reg)
+
+    # Local repair: small, unambiguous mistakes are fixed without asking the model again.
+    rep = {}
+
+    @tool(undo=NOOP, registry=rep)
+    def book(flight_number: str, seats: int, refundable: bool = False, price: float = 0.0):
+        """Typed tool for repair tests."""
+        return flight_number
+
+    @tool(undo=NOOP, registry=rep)
+    def count_seats() -> dict:
+        return {"n": 2}
+
+    fixes = []
+    fixed = parse_plan(json.dumps([{"id": "b", "tool": "Book", "args": {
+        "flightNumber": 101, "Seats": "2", "refundable": "TRUE", "price": "9.5"}}]), rep, repairs=fixes)
+    assert fixed[0]["tool"] == "book" and fixed[0]["args"] == {
+        "flight_number": "101", "seats": 2, "refundable": True, "price": 9.5}
+    assert len(fixes) == 7  # tool name, two argument names, four values
+    python_style = "[{'id': 'b', 'tool': 'book', 'args': {'flight_number': 'AI1', 'seats': 1, 'refundable': True}}]"
+    assert parse_plan(python_style, rep)[0]["args"]["refundable"] is True
+    twice = json.dumps([{"id": "b", "tool": "book", "args_json": json.dumps(json.dumps({"flight_number": "X", "seats": 1}))}])
+    assert parse_plan(twice, rep)[0]["args"] == {"flight_number": "X", "seats": 1}
+    # never touched: references, NaN/inf, values that don't plainly convert
+    kept = parse_plan(json.dumps([{"id": "c", "tool": "count_seats"},
+                                  {"id": "b", "tool": "book", "args": {"flight_number": "X", "seats": "$c.n", "price": "NaN"}}]), rep)
+    assert kept[1]["args"] == {"flight_number": "X", "seats": "$c.n", "price": "NaN"}
+    assert parse_plan(json.dumps([{"id": "b", "tool": "book", "args": {"flight_number": "X", "seats": "two"}}]), rep)
+    # ambiguous names are not guessed: the plan goes back to the model
+    amb = {}
+    tool(lambda: 1, name="hold_seat", undo=NOOP, registry=amb)
+    tool(lambda: 1, name="holdseat", undo=NOOP, registry=amb)
+    expect(PlanRejected, parse_plan, json.dumps([{"id": "h", "tool": "Hold-Seat"}]), amb)
+    # repair=False is strict
+    expect(PlanRejected, parse_plan, python_style, rep, repair=False)
+    expect(PlanRejected, parse_plan, json.dumps([{"id": "b", "tool": "Book", "args": {"flight_number": "X", "seats": 1}}]),
+           rep, repair=False)
+    # agent() repairs locally instead of spending a second model call
+    calls = []
+
+    def sloppy(goal, client, registry):
+        calls.append(goal)
+        return parse_plan(json.dumps([{"id": "b", "tool": "BOOK", "args": {"FlightNumber": 7, "seats": "1"}}]), registry)
+    assert agent("book", planner=sloppy, registry=rep, confirm=lambda st: True) == {"b": "7"} and len(calls) == 1
 
     # Empty responses are clear errors, not StopIteration / IndexError.
     no_text = NS(stop_reason="end_turn", content=[NS(type="thinking")])
