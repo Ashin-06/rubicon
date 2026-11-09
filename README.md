@@ -234,6 +234,10 @@ def cancel_booking(ref: str): ...
 
 - An undo that takes two arguments gets the call's arguments as well as its result, for tools
   that only return `"ok"`.
+- Make every undo safe to run twice (releasing a seat that is already released does nothing).
+  If the process dies after an undo but before it is journaled, `recover()` runs it again; this
+  is true of any compensation-based system, and the randomised tests check Rubicon only ever
+  repeats an undo in that case.
 - A check receives the tool's arguments (with defaults filled in), limited to the parameters it
   declares, so `def must_exist(ref)` works for `def cancel(ref, reason="user")`. Raise to block;
   return a string to show the person confirming what will happen. `confirm(steps)` receives each
@@ -524,7 +528,7 @@ OPENAI_MODEL=llama3.3 OPENAI_BASE_URL=http://localhost:11434/v1 python demo.py o
 - Model output is untrusted. Plans are checked for structure and argument names, but argument
   values are up to your tools. Validate at the tool boundary and give permanent tools a `check`.
 - An undo is a compensation, not a time machine: it is whatever your function does, such as
-  releasing a hold or deleting a draft.
+  releasing a hold or deleting a draft. Make it idempotent (see above).
 - If a permanent step needs another permanent step's output, its dry run can only happen right
   before it runs, after the point of no return. Split the plan if that matters.
 - With `parallel=True`, a step cancelled mid-flight because a sibling failed is not undone (it
@@ -556,6 +560,28 @@ pip install -e ".[all,dev]"
 pytest --cov                   # everything, with coverage
 ```
 
+### Randomised invariant tests
+
+Example tests only cover situations someone thought of, so `tests/test_fuzz.py` also generates
+random plans and agent loops with random tool failures, failing checks, declined
+confirmations, undo outages, parallel runs, and process deaths at every possible point
+(including in the middle of a recovery). After each one, a simulated operator resolves the
+dead letters and recovery runs until done. Then it checks the rules that must always hold:
+
+- an undoable step never runs after a permanent step unless it depends on it,
+- nothing a committed or completed permanent step relied on is ever undone,
+- everything after the last permanent step is cleaned up, by an undo or by the operator,
+- no undo runs for something that never happened,
+- failure reports (`committed`, `undone`, `undo_failed`, `not_run`) match what happened,
+- in the end there are no dead letters, nothing left to recover, and compaction empties the
+  journal.
+
+```bash
+pytest tests/test_fuzz.py                          # 400 of each scenario, as in CI
+RUBICON_FUZZ=20000 pytest tests/test_fuzz.py       # deep run
+RUBICON_FUZZ_SEED=1234 pytest tests/test_fuzz.py   # replay a reported failure
+```
+
 CI runs the core with nothing installed, then the full suite with coverage on Python 3.10 to
 3.13, on Linux, Windows and macOS, against MCP SDK 1.x and 2.x.
 
@@ -564,7 +590,7 @@ rubicon.py        core: registry, ordering, validation, gate, rollback, Transact
 rubicon_mcp.py    MCP adapter
 rubicon_llm.py    Gemini, Claude and OpenAI-compatible planners, plus bring-your-own-model helpers
 demo.py           live demo with fake travel tools
-tests/            pytest entry point for the self-checks
+tests/            pytest entry point for the self-checks, and the randomised invariant tests
 ```
 
 Release notes are in [CHANGELOG.md](CHANGELOG.md).

@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.8.1
+
+### Added
+- Randomised invariant tests (`tests/test_fuzz.py`): random plans and agent loops with random
+  failures, declines, undo outages, parallel runs and process deaths at every possible point,
+  followed by recovery and a simulated operator, checked against the rules that must always
+  hold. 400 scenarios of each kind run in CI; set `RUBICON_FUZZ` for deeper runs.
+
+### Fixed
+- A transaction that settled with a failed undo was skipped by `recover()` from another process
+  for as long as the worker that ran it stayed alive. A settled transaction isn't running, so it
+  is recovered right away.
+- On 64-bit Windows the process liveness check passed 64-bit handles through ctypes without
+  declaring their types; the Windows API signatures are now declared.
+- A crashed transaction whose last open items were resolved with `acknowledge(journal, tx,
+  step)` could not be compacted.
+- On Linux an exited but not yet reaped (zombie) process counted as alive.
+- A transaction whose first step failed stayed marked as live in its process; journal state is
+  also updated only after a write succeeds.
+- When several steps of one parallel wave failed together, only the first failure was read and
+  asyncio reported the others as never retrieved (found by the randomised tests).
+- Plan parsing stops at the first candidate that looks like a plan instead of parsing them all.
+
+### Documented
+- Undo functions must be safe to run twice: a crash after an undo but before it is journaled
+  means `recover()` runs it again.
+
 ## 0.8.0
 
 ### Changed
