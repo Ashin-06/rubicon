@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.5.0
+
+### Fixed
+- The sentinel used for optional MCP parameters leaked through argument binding into checks,
+  confirmations and the journal: checks that didn't take the parameter rejected the plan, the
+  confirmation showed `<unset>`, and the journal lost a step's arguments so `recover()` couldn't
+  undo it. Such parameters are now removed during binding.
+- A check had to accept every optional parameter of its tool. Checks now receive only the
+  parameters they declare.
+- Cancelling or interrupting `arun(..., parallel=True)` could leave steps of the current wave
+  running while the rollback happened, so they could finish afterwards. The wave is now stopped
+  before rolling back.
+- `recover()` journaled only at the end, so recovery interrupted halfway would undo some steps
+  twice on the next run. Each undo is now journaled as it happens, and a transaction is marked
+  finished only when every undo succeeded, so failed undos are retried later (also after an
+  in-process rollback).
+- The journal replaced a step's whole result or arguments when one nested value couldn't be
+  serialized. Only that value is marked now, and recovery refuses to replay a step whose undo
+  would need it.
+- `agent(..., attempts=0)` raised `UnboundLocalError`; `attempts` must now be at least 1.
+- The self-check for parallel runs measured wall-clock time and could fail on a slow machine. It
+  now counts concurrent steps.
+
+### Added
+- `UNSET`, a default for optional parameters that should be left out of a call entirely.
+- A rejected plan's retry now shows the model the plan it wrote, not only the error.
+  `PlanRejected` (a `ValueError`) carries the model's text.
+- `GEMINI_MODEL` and `CLAUDE_MODEL` environment variables override the default models.
+
 ## 0.4.0
 
 ### Fixed

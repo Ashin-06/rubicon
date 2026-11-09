@@ -229,9 +229,13 @@ def cancel_booking(ref: str): ...
 
 - An undo that takes two arguments gets the call's arguments as well as its result, for tools
   that only return `"ok"`.
-- A check takes the same parameters as its tool. Raise to block; return a string to show the
-  person confirming what will happen. `confirm(steps)` receives each step's `id`, `tool`, resolved
-  `args` and `preview`.
+- A check receives the tool's arguments (with defaults filled in), limited to the parameters it
+  declares, so `def must_exist(ref)` works for `def cancel(ref, reason="user")`. Raise to block;
+  return a string to show the person confirming what will happen. `confirm(steps)` receives each
+  step's `id`, `tool`, resolved `args` and `preview`.
+- Use `UNSET` as the default of an optional parameter that should be left out of the call
+  entirely (not passed, not shown at confirmation, not journaled), for example so a remote API
+  applies its own default. MCP tools use it for every optional parameter.
 
 ## MCP servers
 
@@ -283,8 +287,12 @@ agent("...", planner=partial(plan_with_openai, model="llama3.3",          # Olla
 | `plan_with_claude` | `claude` | `ANTHROPIC_API_KEY` | `claude-opus-5-5` |
 | `plan_with_openai` | `openai` | `OPENAI_API_KEY` (not needed for local servers) | none, pass `model=` |
 
+- Override the default models with `GEMINI_MODEL` and `CLAUDE_MODEL` (environment or `.env`), or
+  pass `model=`.
 - If a plan is rejected (bad JSON, unknown tool, wrong argument names, bad ids), `agent()` sends
-  the error back to the model and asks for a corrected plan. `attempts=2` by default.
+  the model its previous plan and the error, and asks for a corrected plan. `attempts=2` by
+  default. A final rejection raises `PlanRejected`, a `ValueError` whose `text` is what the model
+  wrote.
 - `plan_with_openai` sends a strict JSON Schema by default. Use `json_mode="object"` for servers
   that only have a JSON mode, and `json_mode="none"` for servers with neither.
 - Answers wrapped in code fences or surrounded by text are handled, as are bare lists of steps
@@ -317,16 +325,23 @@ recover("rubicon.jsonl")            # after a restart: undo what a crash left ha
 ```
 
 - `parallel=True` runs undoable steps in waves of steps that don't depend on each other. If one
-  fails, the others in its wave are cancelled and everything completed is undone. Permanent
-  steps always run one at a time, in order.
+  fails, or the whole run is cancelled or interrupted, the rest of the wave is stopped first and
+  then everything completed is undone, so no step can finish after the rollback. Permanent steps
+  always run one at a time, in order.
 - `on_event` receives dicts such as `{"event": "step_done", "step": "hold", "tool": "hold_seat",
   "duration_ms": 12.3, "tx": "...", "time": ...}`. Events: `step_started`, `step_done`,
   `check_passed`, `gate_confirmed`, `gate_declined`, `step_committed`, `step_undone`,
   `undo_failed`. Forward them to your logger or tracing system.
 - `journal=` appends one JSON line per step (flushed to disk) with the arguments and result
   needed to undo it. If the process is killed, `recover()` undoes the steps of every unfinished
-  transaction since its last commit, using the same tools, and marks them finished. Results and
-  arguments must be JSON-serializable to be replayed.
+  transaction since its last commit, using the same tools.
+- Recovery journals each undo as it happens, so if recovery itself is interrupted, running it
+  again never undoes anything twice. A transaction is marked finished only when every undo
+  succeeded; anything in a report's `undo_failed` (for example because a service was down) is
+  retried the next time you run `recover()`. The same applies to an in-process rollback whose
+  undo failed.
+- Values that aren't JSON-serializable are marked individually in the journal. A step whose
+  undo would need such a value is reported in `undo_failed` instead of being replayed wrongly.
 
 ## Async
 
@@ -384,6 +399,7 @@ OPENAI_MODEL=llama3.3 OPENAI_BASE_URL=http://localhost:11434/v1 python demo.py o
 | `order(plan, registry=None)` | Validate a plan and return the order it would run in. |
 | `tools_for_llm(registry=None)` | Tools as `{name, description, reversible, parameters}`, with JSON Schema parameters. |
 | `PlanFailed` | Raised after rollback. Attributes: `step`, `cause`, `undone`, `committed`, `not_run`, `undo_failed`, `results`. |
+| `UNSET` | Default for optional parameters that should be left out of the call entirely. |
 | `TOOLS` | The default registry. |
 
 ### `rubicon_mcp`
@@ -402,6 +418,8 @@ OPENAI_MODEL=llama3.3 OPENAI_BASE_URL=http://localhost:11434/v1 python demo.py o
 | `planning_request(goal, registry=None)` | `{"system", "prompt", "schema"}` for any model. |
 | `parse_plan(text, registry=None)` | Turn model output into a validated plan. |
 | `plan_schema(registry=None)` | The plan's JSON Schema. |
+| `PlanRejected` | `ValueError` raised for a plan that fails parsing or validation; `.text` is the model's output. |
+| `GEMINI_MODEL`, `CLAUDE_MODEL` | Default models, overridable with environment variables of the same name. |
 | `ask_human(steps)` | Terminal confirmation with previews. Returns `False` when no terminal is attached. |
 
 ## Security and limitations
