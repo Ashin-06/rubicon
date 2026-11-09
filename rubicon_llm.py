@@ -31,7 +31,8 @@ steps last, dry-runs permanent steps before committing, and rolls back on failur
 need to order steps for safety. Focus on correctness: include every step the goal needs and no \
 others, and use "after" only for real ordering needs. Step ids may use only letters, digits, _ \
 and -. To use an earlier step's result, write "$<step id>": as a whole argument value it passes \
-the raw result, inside text it inserts it as text. args_json must be a JSON object, encoded as a \
+the raw result, inside text it inserts it as text, and "$<step id>.<key>" picks one field of a \
+result that is an object. args_json must be a JSON object, encoded as a \
 string, matching the tool's parameters. Respond with JSON only."""
 
 
@@ -107,8 +108,12 @@ def plan_with_gemini(goal, client=None, registry=None, model=GEMINI_MODEL):
     from google.genai import types
 
     req = planning_request(goal, registry)
-    # timeout is in ms so a stalled model can't hang forever
-    client = client or genai.Client(http_options=types.HttpOptions(timeout=120_000))
+    # timeout is in ms so a stalled model can't hang forever; retry rate limits and overloads
+    # (429/5xx) like the Anthropic and OpenAI SDKs do by default
+    client = client or genai.Client(http_options=types.HttpOptions(
+        timeout=120_000,
+        retry_options=types.HttpRetryOptions(attempts=4, http_status_codes=[408, 429, 500, 502, 503, 504]),
+    ))
     resp = client.models.generate_content(
         model=model,
         contents=req["prompt"],
@@ -172,7 +177,9 @@ def plan_with_openai(goal, client=None, registry=None, *, model, base_url=None, 
         **extra,
     )
     choice = resp.choices[0]
-    if not choice.message.content or choice.finish_reason not in ("stop", None):
+    # servers disagree on the normal finish value ("stop", "eos", "end_turn", None), so only
+    # reject the ones that mean the answer is cut off or withheld
+    if not choice.message.content or choice.finish_reason in ("length", "content_filter", "tool_calls"):
         raise RuntimeError(f"planner returned no plan: finish_reason={choice.finish_reason} "
                            f"refusal={getattr(choice.message, 'refusal', None)}")
     return parse_plan(choice.message.content, registry)
@@ -298,6 +305,8 @@ if __name__ == "__main__":
     plan_with_openai("x", o, reg, model="m3", json_mode="none")
     assert "response_format" not in o.kw
     expect(RuntimeError, plan_with_openai, "x", OpenAI(text, finish="length"), reg, model="m")
+    expect(RuntimeError, plan_with_openai, "x", OpenAI("", finish="stop"), reg, model="m")
+    assert plan_with_openai("x", OpenAI(text, finish="eos"), reg, model="m")  # other normal finishes
     assert state == {"held": 3, "cancelled": ["OLD1"] * 3}
 
     # Bring-your-own model: request + parse, with args as an object instead of args_json.
