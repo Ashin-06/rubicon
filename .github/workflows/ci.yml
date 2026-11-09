@@ -24,11 +24,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install
-        run: pip install -e ".[all]" "${{ matrix.mcp }}"
-      - name: Core (no dependencies)
+      - name: Core with nothing installed (proves zero dependencies)
         run: python rubicon.py
-      - name: MCP adapter
-        run: python rubicon_mcp.py
-      - name: LLM planners (offline stubs, no API keys)
-        run: python rubicon_llm.py
+      - name: Install
+        run: pip install -e ".[all,dev]" "${{ matrix.mcp }}"
+      - name: Test suite with coverage (no API keys, no network)
+        run: pytest -q --cov --cov-report=term-missing
