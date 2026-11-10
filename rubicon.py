@@ -232,7 +232,8 @@ def _lookup(results, sid, path):
                 raise LookupError(f"${sid}{path}: no key {part!r} (keys: {list(value)[:10]})")
             value = value[part]
         elif isinstance(value, (list, tuple)):
-            if not (part.lstrip("-").isdigit() and -len(value) <= int(part) < len(value)):
+            digits = part[1:] if part.startswith("-") else part
+            if not (digits.isascii() and digits.isdigit() and -len(value) <= int(part) < len(value)):
                 raise LookupError(f"${sid}{path}: no index {part!r} in a list of {len(value)}")
             value = value[int(part)]
         else:
@@ -275,8 +276,19 @@ def _prepare(fn, args=(), kwargs=None):
     except (TypeError, ValueError):
         return tuple(args), kwargs, dict(kwargs)
     params = sig.parameters.values()
-    if not args:
-        args = tuple(kwargs.pop(p.name) for p in params if p.kind is p.POSITIONAL_ONLY and p.name in kwargs)
+    if not args:  # in order: an omitted one takes its default, and a missing required one stops here
+        positional, defaults = [], []
+        for p in params:
+            if p.kind is not p.POSITIONAL_ONLY:
+                break
+            if p.name in kwargs:
+                positional += defaults + [kwargs.pop(p.name)]
+                defaults = []
+            elif p.default is not p.empty:
+                defaults.append(p.default)
+            else:
+                break  # bind() reports it, along with any later one still given by name
+        args = tuple(positional)
     bound = sig.bind(*args, **kwargs)
     bound.apply_defaults()
     for name in [n for n, v in bound.arguments.items() if v is UNSET]:
@@ -1095,6 +1107,7 @@ def _replay(records):
             # at commit. The Transaction settles itself when nothing is outstanding.
             tx["open"].pop(step, None)
         elif event == "undo_failed":
+            tx["open"].pop(step, None)
             if step in tx["done"]:
                 tx["owed"][step] = tx["done"].pop(step)
             letters[(tx_id, step)] = {"tx": tx_id, "step": step, "kind": "undo_failed",
@@ -1107,6 +1120,7 @@ def _replay(records):
             if rec.get("kind") == "uncertain":  # reported; nothing more recover() can do about it
                 tx["open"].pop(step, None)
         elif event == "undone":
+            tx["open"].pop(step, None)
             tx["done"].pop(step, None)
             tx["owed"].pop(step, None)
             letters.pop((tx_id, step), None)
@@ -1227,7 +1241,7 @@ async def arecover(journal, registry=None, log=None, *, on_dead_letter=None, inc
                         if t is None or not t.reversible:
                             raise LookupError(f"tool {rec['tool']!r} is not registered as undoable")
                         with_args = _takes_args(t.undo)
-                        if _has_mark(result) or (with_args and _has_mark(args)):
+                        if t.undo is not NOOP and (_has_mark(result) or (with_args and _has_mark(args))):
                             raise ValueError("the step's result or arguments weren't JSON-serializable, "
                                              "so they can't be replayed; undo it by hand")
                         await _attempt(t.undo, (result, args) if with_args else (result,), {},
@@ -1261,8 +1275,13 @@ async def arecover(journal, registry=None, log=None, *, on_dead_letter=None, inc
                 say(f"recover: step(s) {uncertain} of {tx_id} started but never reported a result; "
                     f"they may have happened and can't be undone automatically.")
             await undo_all(newest_first([*tx["done"].values(), *tx["owed"].values()]))
-            # "settled" when an undo is still owed: recovery handled it, nothing runs, retry later
-            j.append([_record("settled" if report["undo_failed"] else "finished", tx_id, status="recovered")])
+            # A transaction that was already settled only had owed undos to retry; its process may be
+            # alive and may have started a new stage meanwhile, which a closing record written now
+            # would wipe. Each "undone" above is enough: it is finished once nothing is owed.
+            if not tx["settled"]:
+                # "settled" when an undo is still owed: recovery handled it, nothing runs, retry later
+                j.append([_record("settled" if report["undo_failed"] else "finished", tx_id,
+                                  status="recovered")])
             reports.append(report)
         return reports
 
@@ -1321,9 +1340,16 @@ def compact(journal) -> int:
 # ---------------------------------------------------------------------------- self-check
 
 if __name__ == "__main__":
+    import datetime
     import functools
     import sys
     import tempfile
+
+    import atexit
+
+    scratch = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    atexit.register(scratch.cleanup)  # removed at exit
+    tempfile.tempdir = scratch.name  # every mkdtemp() below lands inside it
 
     def crashed(tx):
         """Simulate the process dying: the transaction stops being live in this process."""
@@ -2293,6 +2319,67 @@ if __name__ == "__main__":
            registry=seq, journal=path28, log=quiet)
     settles = [r.get("status") for r in FileJournal(path28).records() if r["event"] in ("finished", "settled")]
     assert "step_failed" not in settles, settles
+
+    # recover() retrying an owed undo while the worker starts its next stage: the new stage must
+    # not be closed by a record recover() writes afterwards
+    in_undo, release = threading.Event(), threading.Event()
+    racing, undo_down = {}, [True]
+
+    def slow_undo(result):
+        if undo_down[0]:
+            raise RuntimeError("down")
+        in_undo.set()
+        release.wait(10)
+
+    tool(lambda: "c", name="sc", undo=slow_undo, undo_retries=0, registry=racing)
+    tool(lambda: "b", name="sb", undo=NOOP, registry=racing)
+    path29 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    tx = Transaction(registry=racing, journal=path29, log=quiet)
+    tx.call("sc")
+    tx.rollback()  # owed
+    undo_down[0] = False
+    worker = threading.Thread(target=recover, args=(path29,), kwargs={"registry": racing, "log": quiet})
+    worker.start()
+    assert in_undo.wait(10)
+    tx.call("sb")  # stage 2 starts while recover() is undoing stage 1
+    release.set()
+    worker.join()
+    state = _replay(FileJournal(path29).records())[0][tx.id]
+    assert "sb-2" in state["done"] and not state["owed"] and not state["finished"], state
+    tx.rollback()
+    assert _replay(FileJournal(path29).records())[0][tx.id]["finished"]
+
+    # an undo journaled for a step whose "done" was never written closes that step too
+    for outcome in ("undone", "undo_failed"):
+        torn = _replay([{"tx": "T", "event": "started", "step": "s", "tool": "sa", "permanent": False},
+                        {"tx": "T", "event": outcome, "step": "s"}])[0]["T"]
+        assert not torn["open"], torn
+
+    # a read-only step whose result can't be stored needs nothing undone after a crash
+    dated = {}
+    tool(lambda: datetime.date(2026, 1, 1), name="today", undo=NOOP, registry=dated)
+    path30 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    tx = Transaction(registry=dated, journal=path30, log=quiet)
+    tx.call("today")
+    crashed(tx)
+    rep = recover(path30, registry=dated, log=quiet)
+    assert rep[0]["undone"] == ["today-1"] and not rep[0]["undo_failed"] and not dead_letters(path30), rep
+
+    # positional-only parameters given by name bind in order, defaults filling any gap
+    def two(a, b=2, /):
+        return a, b
+
+    def both_default(a=1, b=2, /):
+        return a, b
+
+    expect(TypeError, _prepare, two, (), {"b": 99})  # a is required and missing
+    assert _prepare(both_default, (), {"b": 99})[2] == {"a": 1, "b": 99}
+    assert _prepare(two, (), {"a": 5})[2] == {"a": 5, "b": 2}
+
+    # list indexes: anything but plain ASCII digits is a bad reference, not a crash
+    for part in ("--0", chr(0xB2), "-"):  # chr(0xB2) is a superscript two
+        expect(LookupError, _lookup, {"s": [1, 2]}, "s", "." + part)
+    assert _lookup({"s": [1, 2]}, "s", ".-1") == (2, "")
 
     # --- settle records: one per settle, none for an empty transaction ---
     path14 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
