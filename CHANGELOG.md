@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.8.5
+
+### Fixed
+- `recover()` retrying the undos an earlier stage still owed wrote a closing record when it
+  finished. If the worker that runs the transaction had started its next stage in the
+  meantime, that record marked the new stage as finished, so a later crash left it in place and
+  `compact()` could remove it while it ran. Recovery of a transaction that was already settled
+  now writes only the per-step "undone" records.
+- After a crash, `recover()` reported a read-only step (`undo=NOOP`) whose result wasn't
+  JSON-serializable as an undo failure and raised a dead letter for it. Such a step needs
+  nothing undone.
+- Positional-only parameters given by name were bound in the wrong order when an earlier one
+  was left out: `def f(a, b=2, /)` called with `{"b": 99}` set `a` to 99. They now bind in order,
+  a left-out one takes its default, and a missing required one is an error.
+- A reference like `$step.--0` or with a non-ASCII digit raised a bare `ValueError` from
+  `int()` instead of being reported as a bad reference.
+- A journal replay left a step open when its undo was recorded without a "done" record (the
+  "done" write failed), so recovery could report it as uncertain.
+- `parse_plan` repaired a cut-off `args_json` by reading an object nested inside it as the
+  arguments. The field is now read whole, or refused.
+- A list of objects in the prose before the plan, such as `Context: [{"flight": "AI101"}]`, was
+  taken for the plan. A bare list counts as a plan only when its items name a tool, and an
+  object only when its `"steps"` is a list.
+- `agent(attempts=True)` was accepted as one attempt.
+- An MCP tool that takes no arguments and declares `additionalProperties: false` accepted any
+  arguments.
+- `demo.py` set an empty environment variable from a blank `KEY=` line in `.env`.
+- The self-checks left their temporary directories behind; `.gitignore` covers test and
+  coverage artifacts.
+
+### Tests
+- A new randomised scenario has another worker's `recover()` retry owed undos while the live
+  worker starts its next stage in the middle of an undo, then commits, rolls back or dies. It
+  fails on 0.8.4. The concurrent-maintenance scenario does the same at random.
+- Every fix above has a self-check that fails when the fix is reverted.
+
 ## 0.8.4
 
 ### Fixed

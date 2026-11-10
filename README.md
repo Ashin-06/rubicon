@@ -366,6 +366,7 @@ recover("rubicon.jsonl")            # after a restart: undo what a crash left ha
   undo failed.
 - Values that aren't JSON-serializable are marked individually in the journal. A step whose
   undo would need such a value is reported in `undo_failed` instead of being replayed wrongly.
+  A read-only step (`undo=NOOP`) needs nothing, so its result can be anything.
 - Every step is journaled as "started" before it runs. If the crash happened while a permanent
   step was running, nobody knows whether it went through, so `recover()` undoes nothing for that
   transaction: undoing what it relied on could leave things worse. It reports the step in
@@ -569,8 +570,10 @@ random plans and agent loops with random tool failures, failing checks, declined
 confirmations, undo outages, parallel runs, and process deaths at every possible point
 (including in the middle of a recovery). One kind of scenario also has another worker run
 `recover()`, `compact()` and `acknowledge()` on the same journal while a transaction is still
-running. After each one, a simulated operator resolves the dead letters and recovery runs until
-done. Then it checks the rules that must always hold:
+running, and one has the live worker start its next stage while that other worker's
+`recover()` is in the middle of retrying an owed undo. After each one, a simulated operator
+resolves the dead letters (leaving failed undos to `recover()` until the outage ends) and
+recovery runs until done. Then it checks the rules that must always hold:
 
 - an undoable step never runs after a permanent step unless it depends on it,
 - nothing a committed or completed permanent step relied on is ever undone,
