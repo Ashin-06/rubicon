@@ -547,7 +547,8 @@ if __name__ == "__main__":
     # a successful call whose text is nested too deeply to parse is still a success
     deep = Server([spec("d")], NS(content=[NS(text="[" * 5000 + "]" * 5000)], isError=False, structuredContent=None))
     call = asyncio.run(register_mcp(deep, registry={}))
-    assert asyncio.run(call("d")).startswith("[[[")
+    deep_result = asyncio.run(call("d"))  # parsed where the stack allows it, else the text itself
+    assert isinstance(deep_result, list) or deep_result.startswith("[[["), type(deep_result)
 
     # a server that hands out new cursors forever is stopped
     class Endless:
