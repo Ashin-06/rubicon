@@ -86,7 +86,7 @@ planners = {"gemini": plan_with_gemini, "claude": plan_with_claude, "openai": op
 if provider not in planners:
     sys.exit(f"unknown provider {provider!r}; choose one of {sorted(planners)}")
 
-goal = "Move my BLR-DEL booking OLD1 to flight AI101 and email me@x.com to confirm."
+goal = "Move my BLR-DEL booking OLD1 to flight AI101 and email me@example.com to confirm."
 try:
     plan = planners[provider](goal, None, reg)
 except Exception as e:  # quota, network, refusal, a plan that stayed invalid...
