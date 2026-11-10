@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   self-checks:
     runs-on: ${{ matrix.os }}
@@ -12,7 +15,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
         mcp: ["mcp>=2"]
         include:
           - { os: ubuntu-latest, python-version: "3.12", mcp: "mcp>=1.26,<2" }
@@ -30,3 +33,22 @@ jobs:
         run: pip install -e ".[all,dev]" "${{ matrix.mcp }}"
       - name: Test suite with coverage (no API keys, no network)
         run: pytest -q --cov --cov-report=term-missing
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build and check the distribution
+        run: |
+          pip install build twine
+          python -m build
+          twine check dist/*
+      - name: Self-checks from the installed wheel, outside the source tree
+        run: |
+          python -m venv /tmp/wheel
+          /tmp/wheel/bin/pip install "$(ls dist/*.whl)[all]"
+          cd /tmp
+          /tmp/wheel/bin/python -c "import rubicon, rubicon_llm, rubicon_mcp, runpy; [runpy.run_path(m.__file__, run_name='__main__') for m in (rubicon, rubicon_llm, rubicon_mcp)]"
