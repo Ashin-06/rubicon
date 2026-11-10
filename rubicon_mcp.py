@@ -54,7 +54,7 @@ def _signature(schema):
     # all. Many servers leave out additionalProperties; accepting anything there would let a
     # hallucinated argument slip through, where the server may silently ignore it.
     extras = schema.get("additionalProperties")
-    if extras is True or isinstance(extras, dict) or not props:
+    if extras is True or isinstance(extras, dict) or (not props and extras is not False):
         extra = next(n for n in ("extra", "extra_args", "_extra") if n not in props)
         params.append(inspect.Parameter(extra, inspect.Parameter.VAR_KEYWORD))
     return inspect.Signature(params)
@@ -164,6 +164,12 @@ if __name__ == "__main__":
     import asyncio
     import os
     import tempfile
+
+    import atexit
+
+    scratch = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    atexit.register(scratch.cleanup)  # removed at exit
+    tempfile.tempdir = scratch.name
     from pathlib import Path
     from types import SimpleNamespace as NS
 
@@ -390,6 +396,7 @@ if __name__ == "__main__":
     assert "**extra" in str(_signature({**plain, "additionalProperties": True}))
     assert "**extra" in str(_signature({**plain, "additionalProperties": {"type": "string"}}))
     assert str(_signature({"type": "object"})) == "(**extra)"
+    assert str(_signature({"type": "object", "properties": {}, "additionalProperties": False})) == "()"
 
     async def fake(*a, **k):
         pass
