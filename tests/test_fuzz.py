@@ -48,6 +48,7 @@ class World:
         self.maintenance = False  # True while "another process" runs recover/compact/acknowledge
         self.owed = set()  # keys whose in-process undo was attempted and failed
         self.finals = set()  # effects made final: in place when a commit returned or a permanent step happened
+        self.interleave = None  # run once from inside another process's undo: the live worker acts
 
     def make_final(self):
         self.finals |= self.items - self.owed
@@ -73,6 +74,9 @@ class World:
             key = result["key"]
             if self.maintenance and key not in self.owed:
                 self.violations.append(f"another process undid {key} while its transaction was running")
+            if self.maintenance and self.interleave:  # the live worker moves on mid-recovery
+                act, self.interleave = self.interleave, None
+                act()
             if key in self.fail_undo:
                 if not self.maintenance:
                     self.owed.add(key)
@@ -404,10 +408,28 @@ class OtherProcess:
     def drop(self, tx_ids):
         self.journal.drop(tx_ids)
 
-    def maintain(self, rng, reg, key_of):
+    def maintain(self, rng, reg, key_of, live_step=None):
+        """live_step, if given, is a step the live worker takes while this process is in the
+        middle of an undo, as a real concurrent worker could."""
         hidden = set(_LIVE)
         _LIVE.clear()
         self.world.maintenance = True
+
+        def live():
+            other_view = set(_LIVE)
+            _LIVE.clear()
+            _LIVE.update(hidden)
+            self.world.maintenance = False
+            try:
+                live_step()
+            finally:
+                hidden.clear()
+                hidden.update(_LIVE)
+                _LIVE.clear()
+                _LIVE.update(other_view)
+                self.world.maintenance = True
+
+        self.world.interleave = live if live_step else None
         try:
             if rng.random() < 0.6:
                 recover(self, registry=reg, log=lambda m: None)
@@ -422,6 +444,7 @@ class OtherProcess:
                     self.world.owed.discard(key_of(letter["step"]))
                     acknowledge(self, letter["tx"], letter["step"], note="handled by hand")
         finally:
+            self.world.interleave = None
             self.world.maintenance = False
             _LIVE.update(hidden)
 
@@ -435,22 +458,28 @@ def scenario_maintenance(rng):
     journal = CrashJournal(world, writes_until_crash=rng.randint(0, 60) if rng.random() < 0.5 else -1,
                            die_in_permanent=0.6 if harsh else 0.2)
     other = OtherProcess(journal, world)
-    completed, labels = False, {}
+    completed, labels, calls = False, {}, [0]
     tx = Transaction(registry=reg, journal=journal, log=lambda m: None,
                      confirm=lambda steps: rng.random() > (0.5 if harsh else 0.15))
+
+    def call(name, key):
+        calls[0] += 1
+        labels[f"{name}-{calls[0]}"] = key  # Transaction labels calls "<tool>-<n>"
+        tx.call(name, key)
+
     try:
         with tx:
             for i in range(rng.randint(1, 8)):
                 key, name = f"t{i}", rng.choice(UNDOABLE + PERMANENT)
-                labels[f"{name}-{i + 1}"] = key
                 if rng.random() < 0.1:
                     world.fail_tool.add(key)
                 if rng.random() < (0.4 if harsh else 0.15):
                     world.fail_undo.add(key)
                 try:
-                    tx.call(name, key)
+                    call(name, key)
                 except Boom:
                     pass
+                next_step = lambda i=i: call(rng.choice(["u0", "u1", "u2"]), f"t{i}x")
                 if rng.random() < 0.25:
                     try:
                         tx.commit()
@@ -458,7 +487,7 @@ def scenario_maintenance(rng):
                     except PlanFailed:
                         pass  # declined or failed: rolled back, and the agent carries on
                 if rng.random() < 0.6:
-                    other.maintain(rng, reg, labels.get)
+                    other.maintain(rng, reg, labels.get, live_step=next_step if rng.random() < 0.5 else None)
                 if rng.random() < 0.05:
                     raise Boom("the agent crashed")
         completed = True
@@ -466,6 +495,53 @@ def scenario_maintenance(rng):
         pass
     if completed:
         world.make_final()
+    recover_until_clean(rng, journal, world, reg, key_of=labels.get)
+    return final_state_problems(world, journal, reg)
+
+
+def scenario_mid_recovery(rng):
+    """A stage rolls back owing undos; another worker's recover() retries them, and while it is in
+    the middle of an undo the live worker starts its next stage. Then the worker carries on,
+    commits, rolls back or dies."""
+    world = World()
+    reg = world.registry()
+    journal = CrashJournal(world, writes_until_crash=-1)
+    other = OtherProcess(journal, world)
+    labels, calls = {}, [0]
+    tx = Transaction(registry=reg, journal=journal, log=lambda m: None, confirm=lambda steps: True)
+
+    def call(name, key):
+        calls[0] += 1
+        labels[f"{name}-{calls[0]}"] = key
+        tx.call(name, key)
+
+    for i in range(rng.randint(1, 4)):  # stage 1: undoable steps, some whose undo will fail
+        key = f"a{i}"
+        if rng.random() < 0.6:
+            world.fail_undo.add(key)
+        call(rng.choice(["u0", "u1", "u2"]), key)
+    try:
+        tx.rollback()
+    except PlanFailed:
+        pass
+    if rng.random() < 0.6:
+        world.fail_undo.clear()  # the outage ends before the other worker retries
+    stage2 = [f"b{i}" for i in range(rng.randint(1, 3))]
+    first, rest = stage2[0], stage2[1:]
+    other.maintain(rng, reg, labels.get, live_step=lambda: call(rng.choice(["u0", "u1", "u2"]), first))
+    try:
+        for key in rest:
+            call(rng.choice(UNDOABLE + PERMANENT), key)
+        end = rng.random()
+        if end < 0.4:
+            _LIVE.discard(tx.id)  # the worker dies here
+        elif end < 0.7:
+            tx.commit()
+            world.make_final()
+        else:
+            tx.rollback()
+    except (PlanFailed, Boom):
+        pass
     recover_until_clean(rng, journal, world, reg, key_of=labels.get)
     return final_state_problems(world, journal, reg)
 
@@ -498,10 +574,16 @@ def test_concurrent_maintenance_invariants():
     _sweep(scenario_maintenance, 3_000_000)
 
 
+def test_mid_recovery_invariants():
+    _sweep(scenario_mid_recovery, 4_000_000)
+
+
 if __name__ == "__main__":
     test_in_process_invariants()
     test_crash_and_recovery_invariants()
     test_transaction_invariants()
     test_concurrent_maintenance_invariants()
-    print(f"fuzz: {COUNT} scenarios each of plans, crash recovery, agent transactions and "
-          f"concurrent maintenance passed")
+    test_mid_recovery_invariants()
+    print(f"fuzz: {COUNT} scenarios each of plans, crash recovery, agent transactions, "
+          f"concurrent maintenance and recovery racing a live worker passed")
+
