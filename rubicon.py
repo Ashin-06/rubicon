@@ -284,15 +284,22 @@ def _prepare(fn, args=(), kwargs=None):
             if p.name in kwargs:
                 positional += defaults + [kwargs.pop(p.name)]
                 defaults = []
-            elif p.default is not p.empty:
+            elif p.default is not p.empty and p.default is not UNSET:
                 defaults.append(p.default)
-            else:
+            else:  # required, or UNSET (which can't be passed by position and then left out)
                 break  # bind() reports it, along with any later one still given by name
         args = tuple(positional)
     bound = sig.bind(*args, **kwargs)
     bound.apply_defaults()
-    for name in [n for n, v in bound.arguments.items() if v is UNSET]:
-        del bound.arguments[name]  # left out entirely: the function's own default applies
+    gap = False
+    for name in list(bound.arguments):
+        p = sig.parameters[name]
+        # left out entirely: the function's own default applies. A positional-only one leaves a
+        # gap, so the positional-only ones after it (defaults: a given one is rejected above)
+        # are left out too, or they would be passed by keyword.
+        if bound.arguments[name] is UNSET or (gap and p.kind is p.POSITIONAL_ONLY):
+            gap = gap or p.kind is p.POSITIONAL_ONLY
+            del bound.arguments[name]
     view = {}
     for name, value in bound.arguments.items():
         if sig.parameters[name].kind is inspect.Parameter.VAR_KEYWORD:
@@ -1347,8 +1354,9 @@ if __name__ == "__main__":
 
     import atexit
 
+    previous_tempdir = tempfile.tempdir
     scratch = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-    atexit.register(scratch.cleanup)  # removed at exit
+    atexit.register(scratch.cleanup)  # removed at exit, also if a check fails
     tempfile.tempdir = scratch.name  # every mkdtemp() below lands inside it
 
     def crashed(tx):
@@ -2375,6 +2383,14 @@ if __name__ == "__main__":
     expect(TypeError, _prepare, two, (), {"b": 99})  # a is required and missing
     assert _prepare(both_default, (), {"b": 99})[2] == {"a": 1, "b": 99}
     assert _prepare(two, (), {"a": 5})[2] == {"a": 5, "b": 2}
+    gap = {}
+
+    @tool(undo=NOOP, registry=gap)
+    def unset_gap(a, b=UNSET, c="d", /):  # b can't be left out while c is given
+        return a
+
+    expect(ValueError, order, [{"id": "s", "tool": "unset_gap", "args": {"a": "1", "c": "x"}}], gap)
+    assert run([{"id": "s", "tool": "unset_gap", "args": {"a": "1"}}], registry=gap, log=quiet) == {"s": "1"}
 
     # list indexes: anything but plain ASCII digits is a bad reference, not a crash
     for part in ("--0", chr(0xB2), "-"):  # chr(0xB2) is a superscript two
@@ -2458,4 +2474,6 @@ if __name__ == "__main__":
     expect(ValueError, tool, functools.partial(print), registry={})
     tool(functools.partial(print), name="say", registry=odd)
     assert "say" in [t["name"] for t in tools_for_llm(odd)]
+    tempfile.tempdir = previous_tempdir
+    scratch.cleanup()
     print("all checks passed")
