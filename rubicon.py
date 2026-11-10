@@ -29,6 +29,8 @@ import asyncio
 import contextlib
 import contextvars
 import enum
+import functools
+import heapq
 import inspect
 import json
 import logging
@@ -104,6 +106,8 @@ def tool(fn=None, *, undo=None, check=None, name=None, registry=None, retries=0,
         if not key:
             raise ValueError(f"{f!r} has no __name__; pass tool(..., name='...')")
         (TOOLS if registry is None else registry)[key] = Tool(f, undo, check, retries, undo_retries, timeout)
+        if timeout and not inspect.iscoroutinefunction(f):
+            _logger.warning("tool %r: timeout= applies only to async functions; this one is sync", key)
         return f
     return register(fn) if fn is not None else register
 
@@ -142,8 +146,13 @@ def _schema(fn) -> dict:
     explicit = getattr(fn, "input_schema", None)
     if explicit:
         return explicit
+    target = fn
+    while isinstance(target, functools.partial):
+        target = target.func
+    if not inspect.isroutine(target) and callable(getattr(target, "__call__", None)):
+        target = target.__call__  # an object with __call__: its hints live on the method
     try:
-        hints = typing.get_type_hints(fn)
+        hints = typing.get_type_hints(target)
     except Exception:
         hints = {}
     try:
@@ -154,7 +163,8 @@ def _schema(fn) -> dict:
     for p in params:
         if p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
             continue
-        props[p.name] = _json_schema(hints[p.name]) if p.name in hints else {}
+        hint = hints.get(p.name, p.annotation if not isinstance(p.annotation, str) else p.empty)
+        props[p.name] = _json_schema(hint) if hint is not p.empty else {}
         if p.default is p.empty:
             required.append(p.name)
     return {"type": "object", "properties": props, "required": required}
@@ -202,13 +212,18 @@ _ID = re.compile(r"[A-Za-z_][\w-]*")
 _REF = re.compile(r"\$([A-Za-z_][\w-]*)((?:\.[\w-]+)*)")  # $id, optionally followed by .key.0 path
 
 
-def _walk(v, f):
+_MAX_DEPTH = 100  # arguments nested deeper than this are refused, never a RecursionError
+
+
+def _walk(v, f, depth=0):
     if isinstance(v, str):
         return f(v)
+    if isinstance(v, (dict, list, tuple)) and depth >= _MAX_DEPTH:
+        raise ValueError(f"arguments are nested more than {_MAX_DEPTH} levels deep")
     if isinstance(v, dict):
-        return {k: _walk(x, f) for k, x in v.items()}
+        return {k: _walk(x, f, depth + 1) for k, x in v.items()}
     if isinstance(v, (list, tuple)):
-        return [_walk(x, f) for x in v]
+        return [_walk(x, f, depth + 1) for x in v]
     return v
 
 
@@ -236,8 +251,11 @@ def _lookup(results, sid, path):
             if not (digits.isascii() and digits.isdigit() and -len(value) <= int(part) < len(value)):
                 raise LookupError(f"${sid}{path}: no index {part!r} in a list of {len(value)}")
             value = value[int(part)]
-        else:
-            return value, "." + ".".join(parts[i:])
+        elif value is None or isinstance(value, (str, int, float, bool)):
+            return value, "." + ".".join(parts[i:])  # a plain value: the rest is ordinary text
+        else:  # an object: dumping it into the text is never what was meant
+            raise LookupError(f"${sid}{path}: {type(value).__name__} is not a dict or list, so it has "
+                              f"no {part!r}")
     return value, ""
 
 
@@ -291,14 +309,18 @@ def _prepare(fn, args=(), kwargs=None):
         args = tuple(positional)
     bound = sig.bind(*args, **kwargs)
     bound.apply_defaults()
-    gap = False
+    gap = False  # an UNSET positional parameter was left out, so later ones can't go by position
     for name in list(bound.arguments):
-        p = sig.parameters[name]
-        # left out entirely: the function's own default applies. A positional-only one leaves a
-        # gap, so the positional-only ones after it (defaults: a given one is rejected above)
-        # are left out too, or they would be passed by keyword.
-        if bound.arguments[name] is UNSET or (gap and p.kind is p.POSITIONAL_ONLY):
-            gap = gap or p.kind is p.POSITIONAL_ONLY
+        p, value = sig.parameters[name], bound.arguments[name]
+        if value is UNSET:  # left out entirely: the function's own default applies
+            gap = gap or p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+            del bound.arguments[name]
+        elif gap and p.kind is p.POSITIONAL_ONLY:  # a default (a given one is rejected above)
+            del bound.arguments[name]
+        elif gap and p.kind is p.VAR_POSITIONAL:
+            if value:
+                raise TypeError(f"extra positional arguments can't follow the left-out argument "
+                                f"before *{name}")
             del bound.arguments[name]
     view = {}
     for name, value in bound.arguments.items():
@@ -306,6 +328,9 @@ def _prepare(fn, args=(), kwargs=None):
             view.update(value)
         else:
             view[name] = value
+    validate = getattr(fn, "validate_args", None)  # for tools whose names can't be parameters
+    if callable(validate):
+        validate(bound.kwargs)
     return bound.args, bound.kwargs, view
 
 
@@ -325,9 +350,21 @@ def _fit(check, args, kwargs, view):
     return a, k
 
 
+def _not_driven(r):
+    """Inside a running loop, sync code (tx.call) can run only sync functions. Refuse an
+    awaitable before any of it runs, so nothing half-happens."""
+    if _DRIVING.get():
+        if inspect.iscoroutine(r):
+            r.close()  # never started: nothing of it ran
+        raise RuntimeError(_ASYNC_IN_SYNC)
+
+
 async def _call(fn, *args, **kwargs):
     r = fn(*args, **kwargs)
-    return await r if inspect.isawaitable(r) else r
+    if inspect.isawaitable(r):
+        _not_driven(r)
+        return await r
+    return r
 
 
 _DRIVING = contextvars.ContextVar("rubicon_driving", default=False)
@@ -352,14 +389,15 @@ def _pid_alive(pid) -> bool:
         kernel32.GetExitCodeProcess.restype = wintypes.BOOL
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel32.CloseHandle.restype = wintypes.BOOL
-        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION: a process that exited with code 259
+        # (STILL_ACTIVE's value) would look alive by its exit code, so wait on it instead
+        handle = kernel32.OpenProcess(0x00100000 | 0x1000, False, pid)
         if not handle:
             return ctypes.get_last_error() == 5  # access denied: it exists
         try:
-            code = wintypes.DWORD()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                return True
-            return code.value == 259  # STILL_ACTIVE
+            return kernel32.WaitForSingleObject(handle, 0) == 0x102  # WAIT_TIMEOUT: still running
         finally:
             kernel32.CloseHandle(handle)
     try:
@@ -383,11 +421,12 @@ async def _attempt(fn, args, kwargs, retries, timeout):
         try:
             r = fn(*args, **kwargs)
             if inspect.isawaitable(r):
+                _not_driven(r)
                 is_async = True
                 r = await (asyncio.wait_for(r, timeout) if timeout else r)
             return r
-        except Exception:
-            if n == retries:
+        except Exception as e:
+            if n == retries or (isinstance(e, RuntimeError) and e.args == (_ASYNC_IN_SYNC,)):
                 raise
             if _DRIVING.get() and not is_async:
                 # sync code driving this directly inside someone else's event loop (tx.call):
@@ -404,7 +443,12 @@ def _takes_args(undo) -> bool:
     except (TypeError, ValueError):
         return False
     positional = [p for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
-    return any(p.kind is p.VAR_POSITIONAL for p in params) or len(positional) >= 2
+    if any(p.kind is p.VAR_POSITIONAL for p in params):
+        return True
+    # undo(result, args); a second parameter with a default (undo(result, force=False)) is an
+    # option of its own, unless it is named args
+    return len(positional) >= 2 and (positional[1].default is positional[1].empty
+                                     or positional[1].name == "args")
 
 
 def _sync(coro, drive=False):
@@ -426,9 +470,12 @@ def _sync(coro, drive=False):
         finally:
             _DRIVING.reset(token)
     coro.close()
-    raise RuntimeError("an async tool, check, undo or confirm can't run from sync code inside a "
-                       "running event loop; use the async API (await arun(...), await tx.acall(...), "
-                       "async with Transaction())")
+    raise RuntimeError(_ASYNC_IN_SYNC)
+
+
+_ASYNC_IN_SYNC = ("an async tool, check, undo or confirm can't run from sync code inside a running "
+                  "event loop; use the async API (await arun(...), await tx.acall(...), async with "
+                  "Transaction())")
 
 
 _MARK = "__unserializable__"
@@ -441,24 +488,46 @@ def _complain(message):
         pass  # a broken logging setup must never break execution; there is nowhere left to report it
 
 
-def _jsonable(value):
-    """A JSON-safe copy: only the parts that can't be serialized are replaced by a marker."""
+def _mark(value):
+    try:
+        text = repr(value)
+    except Exception:  # a broken or self-referencing __repr__
+        text = f"<{type(value).__name__}>"
+    return {_MARK: text[:1000]}
+
+
+def _jsonable(value, depth=0):
+    """A JSON-safe copy: only the parts that can't be serialized are replaced by a marker.
+    Cycles and very deep nesting are marked too, never a crash."""
+    if depth == 0:
+        try:
+            json.dumps(value)
+            return value  # the common case: already JSON, one pass
+        except (TypeError, ValueError, RecursionError):
+            pass  # something inside isn't: mark just those parts below
+    if depth > 100:
+        return _mark(value)
     if isinstance(value, dict):
-        return {k if isinstance(k, str) else str(k): _jsonable(v) for k, v in value.items()}
+        return {k if isinstance(k, str) else str(k): _jsonable(v, depth + 1) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_jsonable(v) for v in value]
+        return [_jsonable(v, depth + 1) for v in value]
     try:
         json.dumps(value)
         return value
-    except (TypeError, ValueError):
-        return {_MARK: repr(value)}
+    except (TypeError, ValueError, RecursionError):
+        return _mark(value)
 
 
 def _has_mark(value) -> bool:
-    if isinstance(value, dict):
-        return _MARK in value or any(_has_mark(v) for v in value.values())
-    if isinstance(value, list):
-        return any(_has_mark(v) for v in value)
+    stack = [value]  # a loop, not recursion: a journaled value may be nested thousands deep
+    while stack:
+        v = stack.pop()
+        if isinstance(v, dict):
+            if _MARK in v:
+                return True
+            stack.extend(v.values())
+        elif isinstance(v, list):
+            stack.extend(v)
     return False
 
 
@@ -490,6 +559,8 @@ def order(plan, registry=None) -> list[dict]:
             raise ValueError(f"step {sid!r}: unknown tool {name!r}")
         if not isinstance(args, dict):
             raise ValueError(f"step {sid!r}: args must be an object")
+        if not all(isinstance(key, str) for key in args):
+            raise ValueError(f"step {sid!r}: argument names must be strings, got {list(args)[:10]!r}")
         if not isinstance(after, list) or not all(isinstance(a, str) for a in after):
             raise ValueError(f"step {sid!r}: after must be a list of step ids")
         t = tools[name]
@@ -500,7 +571,10 @@ def order(plan, registry=None) -> list[dict]:
         except TypeError as e:
             raise ValueError(f"step {sid!r}: arguments {sorted(args)} don't fit {name}: {e}") from None
         by_id[sid] = s
-    deps = {sid: _deps(s, by_id) for sid, s in by_id.items()}
+    try:
+        deps = {sid: _deps(s, by_id) for sid, s in by_id.items()}
+    except ValueError as e:
+        raise ValueError(f"invalid arguments: {e}") from None
     dangling = sorted({d for ds in deps.values() for d in ds} - by_id.keys())
     if dangling:
         raise ValueError(f"steps depend on unknown ids: {dangling}")
@@ -512,9 +586,9 @@ def order(plan, registry=None) -> list[dict]:
         raise ValueError(f"plan has a dependency cycle: {e.args[1]}") from e
     out, ready = [], []
     while ts.is_active():
-        ready += ts.get_ready()
-        ready.sort(key=lambda i: (not tools[by_id[i]["tool"]].reversible, pos[i]))
-        i = ready.pop(0)
+        for i in ts.get_ready():
+            heapq.heappush(ready, (not tools[by_id[i]["tool"]].reversible, pos[i], i))
+        i = heapq.heappop(ready)[2]
         out.append(by_id[i])
         ts.done(i)
     return out
@@ -556,6 +630,7 @@ class Transaction:
         self._journal, self._lock, self._counter = _as_journal(journal), threading.Lock(), 0
         self._began = self._dirty = False
         self._running = set()  # labels of steps currently executing
+        self._rollbacks = 0  # a step that finishes after a rollback started undoes itself
 
     # -- bookkeeping
 
@@ -580,26 +655,34 @@ class Transaction:
         # still alive even after compact() removed its earlier records
         who = {"pid": os.getpid(), "host": _HOST}
         records = [{"tx": self.id, "event": event, "time": now, **data, **who}]
+        opens = event in ("started", "done", "committed")
         with self._lock:
             if not self._began:
                 records.insert(0, {"tx": self.id, "event": "begin", "time": now, **who})
-            self._journal.append(records)  # state changes below only once this succeeded
-            self._began = True
-            if event in ("started", "done", "committed"):
+            was_live = self.id in _LIVE
+            if opens:  # live before the record is durable: a recover() in this process that
+                _LIVE.add(self.id)  # reads it must already see the transaction as running
+            try:
+                self._journal.append(records)
+            except BaseException:
+                if opens and not was_live:
+                    _LIVE.discard(self.id)
+                raise
+            self._began = True  # state changes only once the write succeeded
+            if opens:
                 self._dirty = True
-                _LIVE.add(self.id)
 
     def _settle(self, status):
         """Journal that everything so far is committed or undone. While an earlier undo is still
         owed (tx.undo_failed), write "settled" instead of "finished" so recover() retries it.
         Writes nothing if no step ran since the last settle (no empty or duplicate records)."""
-        _LIVE.discard(self.id)
         if self._dirty:
             self._write("finished" if not self.undo_failed else "settled", status=status)
             self._dirty = False
             # a later stage starts afresh with its own "begin" (pid and host): once settled, its
             # records can be compacted away (after a person acknowledges what was owed, too)
             self._began = False
+        _LIVE.discard(self.id)  # only now: until the record above is durable, it is still running
 
     def _label(self, name):
         with self._lock:
@@ -615,20 +698,35 @@ class Transaction:
 
     async def _run(self, label, name, a, k, view, permanent):
         t = self._tool(name)
-        # write-ahead: if the process dies mid-step, recover() knows this step may have happened
-        self._write("started", step=label, tool=name, permanent=permanent)
+        self._running.add(label)  # before "started": a settle elsewhere must see it as running
+        try:
+            # write-ahead: if the process dies mid-step, recover() knows this step may have happened
+            self._write("started", step=label, tool=name, permanent=permanent)
+        except BaseException:
+            self._running.discard(label)
+            raise
         self._emit("step_started", step=label, tool=name, permanent=permanent)
-        self._running.add(label)
-        start = time.perf_counter()
+        rollbacks, start = self._rollbacks, time.perf_counter()
         try:
             r = await _attempt(t.fn, a, k, t.retries, t.timeout)
         except BaseException as e:
             self._running.discard(label)
-            self._write("step_failed", step=label, tool=name, error=repr(e))
+            try:
+                self._write("step_failed", step=label, tool=name, error=repr(e))
+            except Exception as journal_error:  # the step's own error is what the caller must see
+                _complain(f"could not journal the failure of {label}: {journal_error!r}")
+            self._emit("step_failed", step=label, tool=name, error=repr(e))
             raise
         self._running.discard(label)
         ms = round((time.perf_counter() - start) * 1000, 1)
         self.results[label] = r
+        if not permanent and self._rollbacks != rollbacks:
+            # the transaction was rolled back while this step ran (another thread): undo it too
+            self.done.append({"id": label, "tool": name, "args": view, "result": r})
+            if self._journal:
+                self._write("done", step=label, tool=name, args=_jsonable(view), result=_jsonable(r))
+            await self.arollback()
+            raise RuntimeError(f"the transaction was rolled back while {label} ran; it was undone")
         if permanent:
             self.committed.append(label)
             self.done.clear()  # everything before a committed step is now part of the result
@@ -637,7 +735,8 @@ class Transaction:
             self._say(f"COMMITTED {label}")
         else:
             self.done.append({"id": label, "tool": name, "args": view, "result": r})
-            self._write("done", step=label, tool=name, args=_jsonable(view), result=_jsonable(r))
+            if self._journal:  # no copy to make without one
+                self._write("done", step=label, tool=name, args=_jsonable(view), result=_jsonable(r))
             self._emit("step_done", step=label, tool=name, duration_ms=ms)
             self._say(f"ran {label}")
         return r
@@ -685,25 +784,38 @@ class Transaction:
         """Undo every undoable call since the last commit, in reverse order, and drop pending
         permanent steps. Keeps going if an undo fails or is interrupted; an interruption is
         re-raised once everything has been tried."""
+        self._rollbacks += 1
         undone, failed, interrupted = [], [], None
+
+        def journal(event, **data):
+            try:
+                self._write(event, **data)
+            except Exception as e:  # keep unwinding: the undos matter more than their record
+                _complain(f"could not journal {event} of {data.get('step')}: {e!r}; recover() may "
+                          f"repeat that undo (undos must be idempotent)")
+
         while self.done:
             rec = self.done.pop()
             try:
                 await self._undo(rec)
-                undone.append(rec["id"])
-                self._write("undone", step=rec["id"])
-                self._emit("step_undone", step=rec["id"], tool=rec["tool"])
             except BaseException as e:  # noqa: B036 - an interruption must not strand the rest
                 failed.append(rec["id"])
-                self._write("undo_failed", step=rec["id"], error=repr(e))
+                journal("undo_failed", step=rec["id"], error=repr(e))
                 self._emit("undo_failed", step=rec["id"], tool=rec["tool"], error=repr(e))
                 self._say(f"undo of {rec['id']} failed: {e!r}")
                 if not isinstance(e, Exception) and interrupted is None:
                     interrupted = e
+                continue
+            undone.append(rec["id"])
+            journal("undone", step=rec["id"])
+            self._emit("step_undone", step=rec["id"], tool=rec["tool"])
         self.pending.clear()
         self.undone += undone
         self.undo_failed += failed
-        self._settle("rolled_back")
+        try:
+            self._settle("rolled_back")
+        except Exception as e:  # still running as far as the journal knows: recover() skips it here
+            _complain(f"could not journal the end of the rollback of {self.id}: {e!r}")
         if interrupted is not None:
             raise interrupted
         return undone, failed
@@ -743,10 +855,10 @@ class Transaction:
         return _sync(self.acall(name, *args, **kwargs), drive=True)
 
     def commit(self):
-        return _sync(self.acommit())
+        return _sync(self.acommit(), drive=True)
 
     def rollback(self):
-        return _sync(self.arollback())
+        return _sync(self.arollback(), drive=True)
 
     async def __aenter__(self):
         return self
@@ -895,9 +1007,10 @@ async def arun(plan, registry=None, confirm=None, log=None, *, parallel=False, o
     return dict(results)
 
 
-def run(plan, registry=None, confirm=None, log=None, **kwargs) -> dict:
+def run(plan, registry=None, confirm=None, log=None, *, parallel=False, on_event=None,
+        journal=None) -> dict:
     """Sync version of arun(). Inside an event loop, use `await arun(...)` instead."""
-    return _sync(arun(plan, registry, confirm, log, **kwargs))
+    return _sync(arun(plan, registry, confirm, log, parallel=parallel, on_event=on_event, journal=journal))
 
 
 # ---------------------------------------------------------------------------- journals
@@ -964,6 +1077,13 @@ class FileJournal:
     def append(self, records):
         data = "".join(json.dumps(r, default=repr) + "\n" for r in records)
         with _FileLock(self.path + ".write.lock", blocking=True):
+            try:  # a line torn by a power cut or full disk: end it, or this record joins it
+                with open(self.path, "rb") as f:
+                    f.seek(-1, os.SEEK_END)
+                    if f.read(1) != b"\n":
+                        data = "\n" + data
+            except OSError:
+                pass  # no file yet, or empty: nothing to end
             with open(self.path, "a", encoding="utf-8") as f:
                 f.write(data)
                 f.flush()
@@ -991,11 +1111,15 @@ class FileJournal:
     def lock(self):
         return _FileLock(self.path + ".lock", blocking=False)
 
-    def drop(self, tx_ids):
-        """Remove every record of these transactions (atomic rename; writers wait meanwhile)."""
+    def drop(self, tx_ids, upto=None):
+        """Remove the records of these transactions (atomic rename; writers wait meanwhile).
+        With upto, only among the first `upto` records: ones written since compact() read the
+        journal belong to a new stage and stay."""
         tx_ids = set(tx_ids)
         with _FileLock(self.path + ".write.lock", blocking=True):
-            keep = [r for r in self._read() if r.get("tx") not in tx_ids]
+            records = self._read()
+            upto = len(records) if upto is None else upto
+            keep = [r for i, r in enumerate(records) if i >= upto or r.get("tx") not in tx_ids]
             tmp = self.path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 f.write("".join(json.dumps(r, default=repr) + "\n" for r in keep))
@@ -1047,15 +1171,24 @@ class SQLiteJournal:
     def lock(self):
         return _FileLock(self.path + ".lock", blocking=False)
 
-    def drop(self, tx_ids):
+    def drop(self, tx_ids, upto=None):
+        """Remove the records of these transactions; with upto, only among the first `upto`
+        records (ones written since compact() read the journal stay)."""
         tx_ids = list(tx_ids)
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")  # all chunks or none
             try:
+                last = None
+                if upto is not None:  # the id of the last record compact() saw
+                    row = db.execute("SELECT id FROM rubicon_journal ORDER BY id LIMIT 1 OFFSET ?",
+                                     (max(upto - 1, 0),)).fetchone()
+                    last = row[0] if row and upto > 0 else -1
                 for i in range(0, len(tx_ids), 500):
                     chunk = tx_ids[i:i + 500]
                     # only "?" placeholders are formatted into the SQL; the ids are bound parameters
-                    db.execute(f"DELETE FROM rubicon_journal WHERE tx IN ({','.join('?' * len(chunk))})", chunk)
+                    where = f"tx IN ({','.join('?' * len(chunk))})" + ("" if last is None else " AND id <= ?")
+                    db.execute(f"DELETE FROM rubicon_journal WHERE {where}",
+                               chunk + ([] if last is None else [last]))
                 db.execute("COMMIT")
             except BaseException:
                 db.execute("ROLLBACK")
@@ -1117,8 +1250,13 @@ def _replay(records):
             tx["open"].pop(step, None)
             if step in tx["done"]:
                 tx["owed"][step] = tx["done"].pop(step)
+            old = letters.get((tx_id, step), {})  # a retry that failed again is the same letter
             letters[(tx_id, step)] = {"tx": tx_id, "step": step, "kind": "undo_failed",
-                                      "reason": rec.get("error"), "time": rec.get("time")}
+                                      "reason": rec.get("error"), "time": old.get("time", rec.get("time")),
+                                      **({"_notified": True} if old.get("_notified") else {})}
+        elif event == "notified":  # passed to an on_dead_letter callback
+            if (tx_id, step) in letters:
+                letters[(tx_id, step)]["_notified"] = True
         elif event == "dead_letter":
             letters[(tx_id, step)] = {"tx": tx_id, "step": step, "kind": rec.get("kind"),
                                       "reason": rec.get("reason"), "time": rec.get("time")}
@@ -1138,10 +1276,17 @@ def _replay(records):
                 for part in ("open", "done", "owed"):
                     tx[part].pop(step, None)
                 letters.pop((tx_id, step), None)
-            else:
-                # the outcome of the crash was handled by a person: what was kept or in flight
-                # is settled. Undos owed from an earlier rollback are separate debts and stay
-                # until they succeed or are acknowledged one by one.
+            elif "steps" in rec:
+                # the steps a person handled as they were: settled. Undos owed from an earlier
+                # rollback are separate debts, and a later stage was not part of what they saw
+                for s in rec["steps"]:
+                    if s not in tx["owed"]:
+                        tx["open"].pop(s, None)
+                        tx["done"].pop(s, None)
+                        letters.pop((tx_id, s), None)
+                if not (tx["open"] or tx["done"]):
+                    tx["settled"] = True
+            else:  # written before 0.8.6: everything kept or in flight at that point
                 tx["open"].clear()
                 tx["done"].clear()
                 tx["settled"] = True
@@ -1207,8 +1352,38 @@ async def arecover(journal, registry=None, log=None, *, on_dead_letter=None, inc
     tools = TOOLS if registry is None else registry
     j = _as_journal(journal)
     say = log or _logger.warning
+    def notify(letter):
+        # Each dead letter reaches the callback once, whoever recorded it (a rollback in a
+        # Transaction or run() records its own). Called before "notified" is written, so a crash
+        # in between means a second call, never a missed one.
+        if not on_dead_letter or letter.get("_notified"):
+            return
+        letter["_notified"] = True
+        try:
+            on_dead_letter({k: v for k, v in letter.items() if k != "_notified"})
+        except Exception as e:
+            _complain(f"on_dead_letter callback failed: {e!r}")
+        j.append([_record("notified", letter["tx"], step=letter["step"])])
+
     with _lock_of(j):
         txs, letters = _replay(j.records())
+        if not include_live:
+            # A transaction of this process is judged by _LIVE, which may have changed since the
+            # read: one that settled meanwhile left _LIVE only after its closing record was
+            # durable, so a second read now shows it. Judge those by the second read.
+            mine = [t for t, tx in txs.items() if not (tx["finished"] and not tx["owed"])
+                    and (tx["begin"] or {}).get("pid") == os.getpid()
+                    and (tx["begin"] or {}).get("host") == _HOST and not _maybe_running(tx)]
+            if mine:
+                fresh, fresh_letters = _replay(j.records())
+                for t in mine:
+                    if t in fresh:
+                        txs[t] = fresh[t]
+                    else:
+                        del txs[t]  # compacted away meanwhile: settled
+                letters.update({key: v for key, v in fresh_letters.items() if key[0] in mine})
+        for letter in sorted(letters.values(), key=lambda letter: letter.get("time") or 0):
+            notify(letter)
         reports = []
         for tx_id, tx in txs.items():
             if tx["finished"] and not tx["owed"]:
@@ -1225,11 +1400,7 @@ async def arecover(journal, registry=None, log=None, *, on_dead_letter=None, inc
                 if write:
                     j.append([_record("dead_letter", tx_id, step=step, kind=kind, reason=reason)])
                 letters[(tx_id, step)] = letter
-                if on_dead_letter:
-                    try:
-                        on_dead_letter(dict(letter))
-                    except Exception as e:
-                        _complain(f"on_dead_letter callback failed: {e!r}")
+                notify(letter)
 
             in_flight = [s for s, r in tx["open"].items() if r.get("permanent")]
             uncertain = [s for s, r in tx["open"].items() if not r.get("permanent")]
@@ -1253,14 +1424,17 @@ async def arecover(journal, registry=None, log=None, *, on_dead_letter=None, inc
                                              "so they can't be replayed; undo it by hand")
                         await _attempt(t.undo, (result, args) if with_args else (result,), {},
                                        t.undo_retries, t.timeout)
-                        report["undone"].append(rec["step"])
-                        j.append([_record("undone", tx_id, step=rec["step"], by="recover")])
-                        letters.pop((tx_id, rec["step"]), None)
                     except Exception as e:
                         report["undo_failed"].append(rec["step"])
                         j.append([_record("undo_failed", tx_id, step=rec["step"], error=repr(e))])
                         dead_letter(rec["step"], "undo_failed", repr(e), write=False)
                         say(f"recover: undo of {rec['step']} failed: {e!r}")
+                        continue
+                    report["undone"].append(rec["step"])
+                    # if this write fails, the error propagates and the next recover() repeats
+                    # the undo: never reported as failed when it happened
+                    j.append([_record("undone", tx_id, step=rec["step"], by="recover")])
+                    letters.pop((tx_id, rec["step"]), None)
 
             if in_flight:
                 # keep what the in-flight permanent step may rely on: the steps since the last
@@ -1306,7 +1480,8 @@ def dead_letters(journal) -> list[dict]:
     undo or acknowledge() resolves them. Run recover() first to record crash-related ones.
     """
     _, letters = _replay(_as_journal(journal).records())
-    return sorted(letters.values(), key=lambda letter: letter.get("time") or 0)
+    public = [{k: v for k, v in letter.items() if k != "_notified"} for letter in letters.values()]
+    return sorted(public, key=lambda letter: letter.get("time") or 0)
 
 
 def acknowledge(journal, tx, step=None, note=""):
@@ -1322,7 +1497,19 @@ def acknowledge(journal, tx, step=None, note=""):
         raise ValueError(f"no transaction {tx!r} in {j!r}")
     if step is not None and not any(r.get("step") == step for r in records):
         raise ValueError(f"transaction {tx!r} has no step {step!r}")
-    j.append([_record("resolved", tx, step=step, note=note)])
+    if step is not None:
+        j.append([_record("resolved", tx, step=step, note=note)])
+        return
+    # What recover() kept or found in flight when it reported the crash: the steps before its
+    # last crash report, plus the reported steps. Anything after that is a stage the worker
+    # started later, which the person never checked, so it stays (named, never implied).
+    state, letters = _replay(records)
+    state = state[tx]
+    crash = max((i for i, r in enumerate(records) if r.get("event") == "dead_letter"
+                 and r.get("kind") in ("in_flight_permanent", "uncertain")), default=-1)
+    steps = sorted({*(s for s, r in {**state["open"], **state["done"]}.items() if r["_pos"] < crash),
+                    *(s for (t, s) in letters if t == tx and s not in state["owed"])})
+    j.append([_record("resolved", tx, step=None, steps=steps, note=note)])
 
 
 def compact(journal) -> int:
@@ -1336,11 +1523,21 @@ def compact(journal) -> int:
     if not callable(getattr(j, "drop", None)):
         raise TypeError(f"{j!r} has no drop(tx_ids) method, so it can't be compacted")
     with _lock_of(j):
-        txs, letters = _replay(j.records())
+        records = j.records()
+        txs, letters = _replay(records)
         busy = {key[0] for key in letters}
         settled = [t for t, tx in txs.items() if tx["finished"] and not tx["owed"] and t not in busy]
         if settled:
-            j.drop(settled)
+            # a settled Transaction may start its next stage while this runs: drop only the
+            # records read above, so that stage's new records stay
+            try:
+                takes_upto = "upto" in inspect.signature(j.drop).parameters
+            except (TypeError, ValueError):
+                takes_upto = False
+            if takes_upto:
+                j.drop(settled, upto=len(records))
+            else:
+                j.drop(settled)  # a custom journal: see the README on concurrent compaction
         return len(settled)
 
 
@@ -1348,7 +1545,6 @@ def compact(journal) -> int:
 
 if __name__ == "__main__":
     import datetime
-    import functools
     import sys
     import tempfile
 
@@ -1429,7 +1625,7 @@ if __name__ == "__main__":
             raise ConnectionError("SMTP timeout")
         db["outbox"].append((to, body))
 
-    def plan(flight="AI101", to="me@x.com"):
+    def plan(flight="AI101", to="me@example.com"):
         return [
             {"id": "cancel", "tool": "cancel_booking", "args": {"ref": "OLD1"}},
             {"id": "find", "tool": "search", "args": {"route": "BLR-DEL"}},
@@ -1532,7 +1728,7 @@ if __name__ == "__main__":
     # 9. happy path, with structured events
     events = []
     r = run(plan(), log=quiet, on_event=events.append)
-    assert db["bookings"] == set() and db["outbox"] == [("me@x.com", "held AI101")]
+    assert db["bookings"] == set() and db["outbox"] == [("me@example.com", "held AI101")]
     assert r["hold"] == {"flight": "AI101"}
     kinds = [ev["event"] for ev in events]
     assert kinds[:2] == ["step_started", "step_done"] and "gate_confirmed" in kinds and kinds[-1] == "step_committed"
@@ -1676,8 +1872,8 @@ if __name__ == "__main__":
     with Transaction(registry=odd, log=quiet) as tx:
         tx.wrap("varargs")(1, 2, 3, y=4)
         assert tx.wrap("length")([1, 2]) == 2
-        tx.wrap("mail")("a@b.com")
-    assert got[:2] == [(1, (2, 3), {"y": 4}), ("check", "a@b.com", "none")]
+        tx.wrap("mail")("a@example.com")
+    assert got[:2] == [(1, (2, 3), {"y": 4}), ("check", "a@example.com", "none")]
     assert run([{"id": "n", "tool": "length", "args": {"obj": [1, 2, 3]}}], registry=odd, log=quiet) == {"n": 3}
 
     # async framework: sync tools run on its loop thread; async checks get an async wrapper
@@ -2041,7 +2237,10 @@ if __name__ == "__main__":
     assert [(d["step"], d["kind"]) for d in letters] == [("take-1", "undo_failed")]
     notified = []
     recover(path8, registry=odd, log=quiet, on_dead_letter=notified.append)  # still down
-    assert notified == []  # already a dead letter: reported once, not on every run
+    assert [d["step"] for d in notified] == ["take-1"]  # recorded by the rollback, reported here
+    assert set(notified[0]) == {"tx", "step", "kind", "reason", "time"}
+    recover(path8, registry=odd, log=quiet, on_dead_letter=notified.append)
+    assert len(notified) == 1  # once, not on every run
     acknowledge(path8, tx.id, "take-1", note="released by hand")
     assert dead_letters(path8) == [] and recover(path8, registry=odd, log=quiet) == []
 
@@ -2474,6 +2673,231 @@ if __name__ == "__main__":
     expect(ValueError, tool, functools.partial(print), registry={})
     tool(functools.partial(print), name="say", registry=odd)
     assert "say" in [t["name"] for t in tools_for_llm(odd)]
+
+    # ---------------------------------------------------------------- independent audits, 0.8.6
+    world6 = set()
+    reg6 = {}
+    tool(lambda k: world6.add(k) or k, name="put", undo=lambda r: world6.discard(r), registry=reg6)
+    tool(lambda: "p", name="perm", registry=reg6)
+
+    # compact() never removes records written after it read the journal (a new stage)
+    for kind in (FileJournal, SQLiteJournal):
+        class Racy(kind):
+            hook = None
+
+            def drop(self, tx_ids, upto=None):
+                if self.hook:  # the live worker writes while compact() is between read and drop
+                    hook, self.hook = self.hook, None
+                    hook()
+                return super().drop(tx_ids, upto)
+
+        racy = Racy(os.path.join(tempfile.mkdtemp(), "rubicon.j"))
+        tx = Transaction(registry=reg6, journal=racy, log=quiet)
+        tx.call("put", "a")
+        tx.commit()
+        racy.hook = lambda: tx.call("put", "b")
+        assert compact(racy) == 1
+        assert [r["event"] for r in racy.records() if r["tx"] == tx.id] == ["begin", "started", "done"]
+        crashed(tx)
+        recover(racy, registry=reg6, log=quiet)
+        assert world6 == {"a"}, (kind, world6)
+        world6.clear()
+
+    # a line torn by a power cut is ended, so the next record is not lost with it
+    path31 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    FileJournal(path31).append([{"tx": "T", "event": "begin"}])
+    with open(path31, "a", encoding="utf-8") as f:
+        f.write('{"tx": "other", "event": "done", "resu')
+    FileJournal(path31).append([{"tx": "T", "event": "started", "step": "p-1", "tool": "perm", "permanent": True}])
+    assert [r["event"] for r in FileJournal(path31).records()] == ["begin", "started"]
+
+    # a transaction running in this process is never touched by a recover() here, including
+    # the moments its first and last records are being written
+    class Watching(SQLiteJournal):
+        when, found = None, None
+
+        def append(self, records):
+            if self.when and records[-1]["event"] == self.when:
+                self.when = None
+                worker = threading.Thread(target=lambda: setattr(
+                    self, "found", recover(self, registry=reg6, log=quiet)))
+                worker.start()
+                worker.join()
+            super().append(records)
+
+    for moment in ("started", "finished"):
+        watched = Watching(os.path.join(tempfile.mkdtemp(), "rubicon.db"))
+        tx = Transaction(registry=reg6, journal=watched, log=quiet)
+        watched.when = moment if moment == "started" else None
+        tx.call("put", "seat")
+        watched.when = moment if moment == "finished" else None
+        tx.commit()
+        assert watched.found == [] and world6 == {"seat"} and not dead_letters(watched), (moment, watched.found)
+        world6.clear()
+
+    # acknowledging a whole transaction never settles a stage it started afterwards
+    flaky_undo_down = {"down": True}
+
+    def flaky_undo(r):
+        if flaky_undo_down["down"]:
+            raise RuntimeError("down")
+        world6.discard(r)
+
+    reg7 = {}
+    tool(lambda k: world6.add(k) or k, name="put", undo=flaky_undo, undo_retries=0, registry=reg7)
+    path32 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    tx = Transaction(registry=reg7, journal=path32, log=quiet)
+    tx.call("put", "a")
+    tx.rollback()  # owed
+    tx.call("put", "b")  # the next stage
+    acknowledge(path32, tx.id, note="looked at it")
+    crashed(tx)
+    flaky_undo_down["down"] = False
+    recover(path32, registry=reg7, log=quiet)
+    assert world6 == set(), world6
+    world6.clear()
+
+    # a journal that fails mid-rollback never hides the real error or a step's true outcome
+    class Failing(FileJournal):
+        fail = set()
+
+        def append(self, records):
+            if records[-1]["event"] in self.fail:
+                self.fail.discard(records[-1]["event"])
+                raise OSError("journal unavailable")
+            super().append(records)
+
+    tool(lambda: 1 / 0, name="broken", registry=reg6)
+    failing = Failing(os.path.join(tempfile.mkdtemp(), "rubicon.jsonl"))
+    failing.fail = {"undone", "step_failed"}
+    with captured_warnings():
+        e = expect(PlanFailed, run, [{"id": "a", "tool": "put", "args": {"k": "a"}}, {"id": "x", "tool": "broken"}],
+                   registry=reg6, journal=failing, log=quiet)
+    assert isinstance(e.cause, ZeroDivisionError) and e.undone == ["a"] and e.undo_failed == [], e
+    assert world6 == set()
+
+    # results that can't be journaled are marked, never a failure; without a journal, not even copied
+    def cyclic():
+        node = {"children": []}
+        node["children"].append({"parent": node})
+        return node
+
+    tool(cyclic, name="cyclic", undo=NOOP, registry=reg6)
+    tool(lambda: functools.reduce(lambda acc, _: [acc], range(2000), []), name="deep", undo=NOOP, registry=reg6)
+    assert set(run([{"id": "c", "tool": "cyclic"}, {"id": "d", "tool": "deep"}], registry=reg6, log=quiet)) == {"c", "d"}
+    path33 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    run([{"id": "c", "tool": "cyclic"}, {"id": "d", "tool": "deep"}], registry=reg6, journal=path33, log=quiet)
+    done33 = {r["step"]: r["result"] for r in FileJournal(path33).records() if r["event"] == "done"}
+    assert _has_mark(done33["c"]) and not _has_mark(done33["d"])  # the cycle is marked; deep JSON is kept
+
+    # sync Transaction code inside a running event loop: commit and rollback work like call()
+    async def sync_code_in_loop(fail):
+        with Transaction(registry=reg6, log=quiet) as tx:
+            tx.call("put", "inside")
+            if fail:
+                raise KeyError("agent error")
+
+    expect(KeyError, lambda: asyncio.run(sync_code_in_loop(True)))
+    assert world6 == set()
+    asyncio.run(sync_code_in_loop(False))
+    assert world6 == {"inside"}
+    world6.clear()
+
+    # an async tool called from sync code inside a loop is refused before any of it runs
+    async def put_async(k):
+        world6.add(k)
+        await asyncio.sleep(0)
+
+    tool(put_async, name="put_async", undo=NOOP, registry=reg6)
+
+    async def drive_async():
+        Transaction(registry=reg6, log=quiet).call("put_async", "half")
+
+    expect(RuntimeError, lambda: asyncio.run(drive_async()))
+    assert world6 == set()
+
+    # a step is marked running before "started" is written, so no settle can miss it
+    class Peeking(FileJournal):
+        seen = None
+
+        def append(self, records):
+            if records[-1]["event"] == "started":
+                self.seen = set(peek_tx._running)
+            super().append(records)
+
+    peeking = Peeking(os.path.join(tempfile.mkdtemp(), "rubicon.jsonl"))
+    peek_tx = Transaction(registry=reg6, journal=peeking, log=quiet)
+    peek_tx.call("put", "x")
+    assert peeking.seen == {"put-1"}, peeking.seen
+    peek_tx.rollback()
+
+    # a step that finishes on another thread after a rollback undoes itself
+    gate = threading.Event()
+
+    def slow_put(k):
+        gate.wait(10)
+        world6.add(k)
+        return k
+
+    tool(slow_put, name="slow_put", undo=lambda r: world6.discard(r), registry=reg6)
+    tx = Transaction(registry=reg6, log=quiet)
+    outcome = []
+    worker = threading.Thread(target=lambda: outcome.append(expect(RuntimeError, tx.call, "slow_put", "late")))
+    worker.start()
+    time.sleep(0.05)
+    tx.rollback()
+    gate.set()
+    worker.join()
+    assert world6 == set() and "slow_put-1" in tx.undone and outcome, (world6, tx.undone)
+
+    # a process that exited with code 259 (STILL_ACTIVE's value on Windows) is not alive
+    child = subprocess.Popen([sys.executable, "-c", "import os; os._exit(259)"])
+    child.wait()
+    assert not _pid_alive(child.pid)  # the Popen object still holds its handle
+
+    # plan inputs: names must be strings, *args after a left-out argument, big plans stay fast
+    expect(ValueError, order, [{"id": "s", "tool": "put", "args": {1: 2, "k": 3}}], reg6)
+
+    @tool(undo=NOOP, registry=reg6)
+    def star(a, b=UNSET, *rest):
+        return a
+
+    assert run([{"id": "s", "tool": "star", "args": {"a": 1}}], registry=reg6, log=quiet) == {"s": 1}
+    started = time.perf_counter()
+    order([{"id": f"s{i}", "tool": "put", "args": {"k": i}} for i in range(5000)], reg6)
+    assert time.perf_counter() - started < 3, "order() must not be quadratic"
+
+    # a path into an object that isn't a dict or list is a bad reference, not dumped text
+    @dataclass
+    class Seat:
+        seat: str
+
+    tool(lambda: Seat("12A"), name="seat_obj", undo=NOOP, registry=reg6)
+    tool(lambda body: body, name="say", undo=NOOP, registry=reg6)
+    e = expect(PlanFailed, run, [{"id": "h", "tool": "seat_obj"},
+                                 {"id": "m", "tool": "say", "args": {"body": "Seat $h.seat"}}], registry=reg6, log=quiet)
+    assert "not a dict or list" in str(e.cause)
+
+    # an undo with an option of its own gets just the result
+    got = []
+    tool(lambda k: k, name="opt", undo=lambda r, force=False: got.append((r, force)), registry=reg6)
+    t = Transaction(registry=reg6, log=quiet)
+    t.call("opt", "z")
+    t.rollback()
+    assert got == [("z", False)]
+
+    # tool descriptions see the hints of partials and callable objects
+    class Typed:
+        def __call__(self, x: int):
+            return x
+
+    assert _schema(Typed())["properties"] == {"x": {"type": "integer"}}
+
+    def two_args(a: int, b: str = "b"):
+        return a
+
+    assert _schema(functools.partial(two_args, b="c"))["properties"] == {"a": {"type": "integer"}, "b": {"type": "string"}}
+
     tempfile.tempdir = previous_tempdir
     scratch.cleanup()
     print("all checks passed")
