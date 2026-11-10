@@ -1,6 +1,6 @@
 """Let any LLM write the plan; Rubicon executes it safely.
 
-    agent("Move booking OLD1 to AI101 and email me@x.com")                       # Gemini
+    agent("Move booking OLD1 to AI101 and email me@example.com")                       # Gemini
     agent("...", planner=plan_with_claude)                                       # Claude
     agent("...", planner=partial(plan_with_openai, model="gpt-5.1"))             # OpenAI
     agent("...", planner=partial(plan_with_openai, model="llama3.3",             # any OpenAI-
@@ -27,6 +27,7 @@ import logging
 import math
 import os
 import re
+import warnings
 
 from rubicon import TOOLS, _schema, arun, order, run, tools_for_llm
 
@@ -96,6 +97,7 @@ def planning_request(goal, registry=None):
 
 
 _MAX_STARTS = 64  # bracket positions tried when looking for JSON inside prose
+_NOT_READABLE = (ValueError, SyntaxError, MemoryError, RecursionError, TypeError)
 
 
 def _plan_like(value):
@@ -104,46 +106,79 @@ def _plan_like(value):
         isinstance(value, list) and bool(value) and all(isinstance(x, dict) and "tool" in x for x in value))
 
 
-def _pick(candidates):
-    """The first candidate that looks like a plan, else the first object or array at all, so
-    a stray "[1]" in the prose before the plan doesn't win."""
-    first = None
-    for i, candidate in enumerate(candidates):  # lazily: stop at the first plan
-        if _plan_like(candidate):
-            return candidate
-        if i == 0:
-            first = candidate
-    return first
+def _close(text, start):
+    """End (exclusive) of the bracketed value opening at start, skipping quoted strings; None if
+    it never closes. One pass over the text, so trying many starts stays cheap."""
+    depth, quote, i, n = 0, None, start, len(text)
+    while i < n:
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
 
 
-def _starts(text):
-    return [i for i, ch in enumerate(text) if ch in "{["][:_MAX_STARTS]
+def _values(text, read):
+    """Each top-level bracketed value in the text that `read` accepts, in order. A value found
+    inside one already read (the steps list of a plan) is part of it, not another candidate."""
+    found, taken_until, tried = [], -1, 0
+    for start, ch in enumerate(text):
+        if ch not in "{[" or start < taken_until:
+            continue
+        tried += 1
+        if tried > _MAX_STARTS:
+            break
+        end = _close(text, start)
+        if end is None:
+            continue
+        try:
+            value = read(text[start:end])
+        except _NOT_READABLE:
+            continue
+        if isinstance(value, (dict, list)):
+            found.append(value)
+            taken_until = end
+    return found
+
+
+def _pick(values):
+    """The plan among the values, else the first value at all, so a stray "[1]" in the prose
+    before the plan doesn't win. Two different plans are ambiguous: neither is guessed."""
+    plans = [v for v in values if _plan_like(v)]
+    if any(p != plans[0] for p in plans[1:]):
+        raise ValueError(f"model output contains {len(plans)} different plans; write exactly one")
+    if plans:
+        return plans[0]
+    return values[0] if values else None
+
+
+def _quiet_literal(text):
+    with warnings.catch_warnings():  # e.g. SyntaxWarning for "\d": the library never prints
+        warnings.simplefilter("ignore")
+        return ast.literal_eval(text)
 
 
 def _literal(text):
     """Python-style dict/list output (single quotes, True/None) from models without a JSON mode.
     ast.literal_eval only reads literals; it never runs code."""
-    ends = [i + 1 for i, ch in enumerate(text) if ch in "}]"][::-1][:_MAX_STARTS]
-
-    def candidates():
-        for start in _starts(text):
-            for end in ends:
-                if end <= start:
-                    break
-                try:
-                    value = ast.literal_eval(text[start:end])
-                except (ValueError, SyntaxError, MemoryError, RecursionError, TypeError):
-                    continue
-                if isinstance(value, (dict, list)):
-                    yield value
-                    break  # the longest literal from this start
-    return _pick(candidates())
+    return _pick(_values(text, _quiet_literal))
 
 
 def _whole_literal(text):
     try:
-        value = ast.literal_eval(text.strip())
-    except (ValueError, SyntaxError, MemoryError, RecursionError, TypeError):
+        value = _quiet_literal(text.strip())
+    except _NOT_READABLE:
         return None
     return value if isinstance(value, (dict, list)) else None
 
@@ -154,17 +189,11 @@ def _loads(text, repairs=None):
     t = text.strip()
     try:
         return json.loads(t)
+    except RecursionError:
+        raise ValueError("model output is nested too deeply") from None
     except ValueError:
         pass  # not bare JSON: look for JSON inside prose or fences below
-    decoder = json.JSONDecoder()
-
-    def candidates():
-        for i in _starts(t):
-            try:
-                yield decoder.raw_decode(t, i)[0]
-            except ValueError:
-                continue
-    value = _pick(candidates())
+    value = _pick(_values(t, json.loads))
     if value is not None and (_plan_like(value) or repairs is None):
         return value
     if repairs is not None:
@@ -269,6 +298,36 @@ def parse_plan(text, registry=None, *, repair=True, repairs=None):
     return plan
 
 
+# What models write for a step's fields, normalised (see _norm). A misnamed field must never be
+# dropped silently: the tool would run without its arguments, or before what it depends on.
+_FIELD_NAMES = {
+    "id": "id", "stepid": "id",
+    "tool": "tool", "toolname": "tool",
+    "args": "args", "arguments": "args", "params": "args", "parameters": "args", "kwargs": "args",
+    "input": "args", "inputs": "args",
+    "argsjson": "args_json", "argumentsjson": "args_json",
+    "after": "after", "dependson": "after", "dependencies": "after", "deps": "after",
+    "requires": "after", "needs": "after",
+}
+
+
+def _fields(s, repairs):
+    """A step with its fields under their canonical names; other keys (notes, reasons) are ignored."""
+    out = {}
+    for key, value in s.items():
+        name = _FIELD_NAMES.get(_norm(key))
+        if name is None:
+            continue
+        if name in out:
+            raise ValueError(f"step {s.get('id')!r}: both {out[name][0]!r} and {key!r} given")
+        if key != name:
+            if repairs is None:
+                raise ValueError(f"step {s.get('id')!r}: unknown field {key!r}; did you mean {name!r}?")
+            repairs.append(f"step {s.get('id')!r}: read field {key!r} as {name!r}")
+        out[name] = (key, value)
+    return {name: value for name, (_, value) in out.items()}
+
+
 def _parse_plan(text, registry, repairs):
     data = _loads(text, repairs)
     steps = data if isinstance(data, list) else data.get("steps") if isinstance(data, dict) else None
@@ -278,12 +337,15 @@ def _parse_plan(text, registry, repairs):
     for s in steps:
         if not isinstance(s, dict):
             raise ValueError(f"step is not an object: {s!r}")
+        s = _fields(s, repairs)
         args, raw = s.get("args"), s.get("args_json")
         if isinstance(raw, str) and raw.strip() == "null":
             raw = None  # JSON null written as text: no args_json, so "args" (if any) stands
         if isinstance(raw, str) and raw.strip():
             try:
                 args = json.loads(raw)
+            except RecursionError:
+                raise ValueError(f"step {s.get('id')!r}: args_json is nested too deeply") from None
             except ValueError:
                 # the field holds just the arguments, so read it whole: a fragment of broken JSON
                 # (an inner object of a cut-off one) must not pass for the arguments
@@ -313,7 +375,7 @@ def plan_with_gemini(goal, client=None, registry=None, model=None):
     from google import genai
     from google.genai import types
 
-    model = model or os.environ.get("GEMINI_MODEL") or GEMINI_MODEL
+    model = model or (os.environ.get("GEMINI_MODEL") or "").strip() or GEMINI_MODEL
     req = planning_request(goal, registry)
     # timeout is in ms so a stalled model can't hang forever; retry rate limits and overloads
     # (429/5xx) like the Anthropic and OpenAI SDKs do by default
@@ -339,7 +401,7 @@ def plan_with_gemini(goal, client=None, registry=None, model=None):
 
 def plan_with_claude(goal, client=None, registry=None, model=None):
     """Claude via anthropic. Reads ANTHROPIC_API_KEY."""
-    model = model or os.environ.get("CLAUDE_MODEL") or CLAUDE_MODEL
+    model = model or (os.environ.get("CLAUDE_MODEL") or "").strip() or CLAUDE_MODEL
     req = planning_request(goal, registry)
     if client is None:
         import anthropic
@@ -370,6 +432,8 @@ def plan_with_openai(goal, client=None, registry=None, *, model, base_url=None, 
     JSON mode, or "none" for servers with neither (the schema is then put in the prompt).
     Reads OPENAI_API_KEY unless api_key is given; local servers need no key.
     """
+    if json_mode not in ("schema", "object", "none"):
+        raise ValueError(f'json_mode must be "schema", "object" or "none", got {json_mode!r}')
     req = planning_request(goal, registry)
     if client is None:
         import openai
@@ -438,7 +502,7 @@ def agent(goal, planner=plan_with_gemini, client=None, registry=None, confirm=as
         try:
             plan = planner(goal if error is None else _retry_goal(goal, error), client, registry)
             break
-        except ValueError as e:
+        except PlanRejected as e:  # only a rejected plan goes back to the model, not a config error
             error = e
             if n == attempts - 1:
                 raise
@@ -457,14 +521,15 @@ async def aagent(goal, planner=plan_with_gemini, client=None, registry=None, con
     async def make_plan(g):
         if inspect.iscoroutinefunction(planner):
             return await planner(g, client, registry)
-        return await asyncio.to_thread(planner, g, client, registry)
+        plan = await asyncio.to_thread(planner, g, client, registry)
+        return await plan if inspect.isawaitable(plan) else plan  # a lambda around an async planner
 
     error = None
     for n in range(attempts):
         try:
             plan = await make_plan(goal if error is None else _retry_goal(goal, error))
             break
-        except ValueError as e:
+        except PlanRejected as e:
             error = e
             if n == attempts - 1:
                 raise
@@ -472,7 +537,10 @@ async def aagent(goal, planner=plan_with_gemini, client=None, registry=None, con
         sync_confirm = confirm
 
         async def confirm(steps):
-            return await asyncio.to_thread(sync_confirm, steps)
+            answer = await asyncio.to_thread(sync_confirm, steps)
+            # a lambda around an async function, or an object with async __call__: its answer
+            # is a coroutine, which must be awaited, never taken as a yes
+            return await answer if inspect.isawaitable(answer) else answer
     return await arun(plan, registry, confirm, log, **run_kwargs)
 
 
@@ -775,4 +843,63 @@ if __name__ == "__main__":
     finally:
         builtins.input = real_input
     assert state == {"held": 5, "cancelled": ["OLD1"] * 6}
+
+    # An async confirm reached through a lambda or an object is awaited: a "no" stays a no.
+    async def says_no(steps):
+        return False
+
+    class AsyncNo:
+        async def __call__(self, steps):
+            return False
+
+    for no in (lambda st: says_no(st), AsyncNo()):
+        expect(PlanFailed, lambda: asyncio.run(aagent("move", client=Gemini(text), registry=reg,
+                                                      confirm=no, log=quiet)))
+    # ...and so is a planner reached through a lambda
+    plan = asyncio.run(aagent("move", planner=lambda g, c, r: async_planner(g, c, r), registry=reg,
+                              confirm=lambda st: True, log=quiet))
+    assert plan["c"] is None
+    assert state["cancelled"] == ["OLD1"] * 7
+
+    # Only a rejected plan goes back to the model: a configuration error is raised at once.
+    calls = []
+
+    def misconfigured(goal, client, registry):
+        calls.append(goal)
+        raise ValueError("Invalid API key format: sk-...")
+    expect(ValueError, agent, "x", planner=misconfigured, registry=reg, attempts=3, log=quiet)
+    assert len(calls) == 1
+    expect(ValueError, plan_with_openai, "x", NS(), reg, model="m", json_mode="bogus")
+
+    # Two different plans in one answer are ambiguous: refused, never the first one guessed.
+    two = ('I considered [{"id": "c", "tool": "cancel_booking", "args": {"ref": "ALL"}}] but use this: '
+           '{"steps": [{"id": "s", "tool": "search", "args": {"route": "x"}}]}')
+    expect(PlanRejected, parse_plan, two, reg)
+    one = json.dumps({"steps": naive})
+    assert len(parse_plan(f"```json {one} ``` Again: {one}", reg)) == 3  # the same plan twice is fine
+
+    # Hostile shapes: deep nesting is refused cleanly, and long garbage stays fast.
+    for deep in ("[" * 100000 + "]" * 100000, "[" * 100000,
+                 '[{"id": "s", "tool": "search", "args": {"route": ' + "[" * 1500 + "]" * 1500 + "}}]"):
+        expect(PlanRejected, parse_plan, deep, reg)
+    import time as _time
+    started = _time.perf_counter()
+    expect(PlanRejected, parse_plan, "[" * 64 + "a," * 4000 + "]" * 64, reg)
+    assert _time.perf_counter() - started < 3, "the literal fallback must stay linear"
+    import warnings as _warnings
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("error")  # the library never prints, not even a SyntaxWarning
+        parse_plan("[{'id': 's', 'tool': 'search', 'args': {'route': '" + chr(92) + "d'}}]", reg)
+
+    # A misnamed step field is read as what it means, or refused; never silently dropped.
+    named = parse_plan(json.dumps([{"id": "s", "tool": "search", "arguments": {"route": "x"}},
+                                   {"id": "h", "tool": "hold_seat", "args": {"flight": "f"},
+                                    "depends_on": ["s"]}]), reg)
+    assert named[0]["args"] == {"route": "x"} and named[1]["after"] == ["s"]
+    expect(PlanRejected, parse_plan, json.dumps([{"id": "s", "tool": "search", "arguments": {"route": "x"}}]),
+           reg, repair=False)
+    expect(PlanRejected, parse_plan, json.dumps([{"id": "s", "tool": "search", "args": {"route": "x"},
+                                                  "arguments": {"route": "y"}}]), reg)
+    assert parse_plan(json.dumps([{"id": "s", "tool": "search", "args": {"route": "x"},
+                                   "reason": "find flights first"}]), reg)  # notes are fine
     print("all planner checks passed")
