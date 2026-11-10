@@ -99,8 +99,9 @@ _MAX_STARTS = 64  # bracket positions tried when looking for JSON inside prose
 
 
 def _plan_like(value):
-    return (isinstance(value, dict) and "steps" in value) or (
-        isinstance(value, list) and bool(value) and all(isinstance(x, dict) for x in value))
+    """A {"steps": [...]} object, or a bare list of steps (objects that name a tool)."""
+    return (isinstance(value, dict) and isinstance(value.get("steps"), list)) or (
+        isinstance(value, list) and bool(value) and all(isinstance(x, dict) and "tool" in x for x in value))
 
 
 def _pick(candidates):
@@ -137,6 +138,14 @@ def _literal(text):
                     yield value
                     break  # the longest literal from this start
     return _pick(candidates())
+
+
+def _whole_literal(text):
+    try:
+        value = ast.literal_eval(text.strip())
+    except (ValueError, SyntaxError, MemoryError, RecursionError, TypeError):
+        return None
+    return value if isinstance(value, (dict, list)) else None
 
 
 def _loads(text, repairs=None):
@@ -274,7 +283,9 @@ def _parse_plan(text, registry, repairs):
             try:
                 args = json.loads(raw)
             except ValueError:
-                args = _literal(raw) if repairs is not None else None
+                # the field holds just the arguments, so read it whole: a fragment of broken JSON
+                # (an inner object of a cut-off one) must not pass for the arguments
+                args = _whole_literal(raw) if repairs is not None else None
                 if args is None:
                     raise
                 repairs.append(f"step {s.get('id')!r}: read Python-style args_json")
@@ -407,7 +418,7 @@ def _retry_goal(goal, error):
 
 
 def _check_attempts(attempts):
-    if not isinstance(attempts, int) or attempts < 1:
+    if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1:
         raise ValueError(f"attempts must be a whole number of at least 1, got {attempts!r}")
 
 
@@ -601,6 +612,13 @@ if __name__ == "__main__":
     expect(ValueError, planning_request, "x", {})  # nothing to plan with
     bare = {}
     tool(lambda: 1, name="ping", undo=NOOP, registry=bare)
+    # a cut-off args_json is refused whole, not read as the inner object it happens to contain
+    expect(ValueError, parse_plan, json.dumps([{"id": "a", "tool": "search",
+                                                "args_json": '{"broken": {"route": "BLR"}'}]), reg)
+    # a list of objects in the prose before the plan is not taken for the plan
+    prose = ('Context: [{"flight": "AI101"}]\nPlan: {"steps": [{"id": "s", "tool": "search", '
+             '"args": {"route": "x"}}]}')
+    assert [s["id"] for s in parse_plan(prose, reg)] == ["s"]
     for not_args in ([1, 2], 3, True):  # args_json that is not an object is refused, never read as {}
         expect(ValueError, parse_plan, json.dumps([{"id": "a", "tool": "ping", "args_json": not_args}]), bare)
 
@@ -723,7 +741,7 @@ if __name__ == "__main__":
     goals.clear()
     e = expect(PlanRejected, agent, "x", planner=picky, registry=reg, attempts=1, log=quiet)
     assert isinstance(e, ValueError) and "booking_id" in e.text
-    for bad_attempts in (0, -1, 1.5):
+    for bad_attempts in (0, -1, 1.5, True):
         expect(ValueError, agent, "x", planner=picky, registry=reg, attempts=bad_attempts, log=quiet)
     expect(ValueError, lambda: asyncio.run(aagent("x", planner=picky, registry=reg, attempts=0, log=quiet)))
     assert state["cancelled"] == ["OLD1"] * 4
