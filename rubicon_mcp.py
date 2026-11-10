@@ -167,8 +167,9 @@ if __name__ == "__main__":
 
     import atexit
 
+    previous_tempdir = tempfile.tempdir
     scratch = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-    atexit.register(scratch.cleanup)  # removed at exit
+    atexit.register(scratch.cleanup)  # removed at exit, also if a check fails
     tempfile.tempdir = scratch.name
     from pathlib import Path
     from types import SimpleNamespace as NS
@@ -424,4 +425,6 @@ if __name__ == "__main__":
                     return await inner(**kw)
             return Callable()
     assert [t.name for t in asyncio.run(list_all_tools(Opaque()))] == ["a", "b", "c", "d"]
+    tempfile.tempdir = previous_tempdir
+    scratch.cleanup()
     print("all MCP checks passed")

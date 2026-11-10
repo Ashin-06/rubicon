@@ -4,6 +4,7 @@ The checks live next to the code they test, so `python rubicon.py` still works o
 """
 import importlib.util
 import runpy
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -19,7 +20,11 @@ def _missing(module):
 
 
 def _run(module):
-    runpy.run_path(str(ROOT / f"{module}.py"), run_name="__main__")
+    previous = tempfile.tempdir  # the checks point it at their own scratch folder
+    try:
+        runpy.run_path(str(ROOT / f"{module}.py"), run_name="__main__")
+    finally:
+        tempfile.tempdir = previous
 
 
 def test_core():
