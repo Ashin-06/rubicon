@@ -520,15 +520,14 @@ def scenario_mid_recovery(rng):
         if rng.random() < 0.6:
             world.fail_undo.add(key)
         call(rng.choice(["u0", "u1", "u2"]), key)
-    try:
-        tx.rollback()
-    except PlanFailed:
-        pass
+    tx.rollback()  # returns what it undid and what failed; it does not raise for a failed undo
     if rng.random() < 0.6:
         world.fail_undo.clear()  # the outage ends before the other worker retries
     stage2 = [f"b{i}" for i in range(rng.randint(1, 3))]
     first, rest = stage2[0], stage2[1:]
     other.maintain(rng, reg, labels.get, live_step=lambda: call(rng.choice(["u0", "u1", "u2"]), first))
+    if rng.random() < 0.3:
+        journal.left = rng.randint(0, 4)  # the process may also die at a journal write from here on
     try:
         for key in rest:
             call(rng.choice(UNDOABLE + PERMANENT), key)
@@ -540,7 +539,7 @@ def scenario_mid_recovery(rng):
             world.make_final()
         else:
             tx.rollback()
-    except (PlanFailed, Boom):
+    except (PlanFailed, Boom, Died):
         pass
     recover_until_clean(rng, journal, world, reg, key_of=labels.get)
     return final_state_problems(world, journal, reg)
