@@ -279,6 +279,8 @@ def _parse_plan(text, registry, repairs):
         if not isinstance(s, dict):
             raise ValueError(f"step is not an object: {s!r}")
         args, raw = s.get("args"), s.get("args_json")
+        if isinstance(raw, str) and raw.strip() == "null":
+            raw = None  # JSON null written as text: no args_json, so "args" (if any) stands
         if isinstance(raw, str) and raw.strip():
             try:
                 args = json.loads(raw)
@@ -612,6 +614,10 @@ if __name__ == "__main__":
     expect(ValueError, planning_request, "x", {})  # nothing to plan with
     bare = {}
     tool(lambda: 1, name="ping", undo=NOOP, registry=bare)
+    # args_json written as the text "null" means no args_json: "args" stands, or there are none
+    assert parse_plan(json.dumps([{"id": "s", "tool": "search", "args": {"route": "R"},
+                                   "args_json": "null"}]), reg)[0]["args"] == {"route": "R"}
+    assert parse_plan(json.dumps([{"id": "p", "tool": "ping", "args_json": " null "}]), bare)[0]["args"] == {}
     # a cut-off args_json is refused whole, not read as the inner object it happens to contain
     expect(ValueError, parse_plan, json.dumps([{"id": "a", "tool": "search",
                                                 "args_json": '{"broken": {"route": "BLR"}'}]), reg)
