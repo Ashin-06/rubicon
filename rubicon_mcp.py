@@ -29,19 +29,50 @@ from rubicon import NOOP, TOOLS, UNSET, Tool
 
 __all__ = ["list_all_tools", "register_mcp"]
 
+_MAX_PAGES = 1000
 _PY_TYPES = {"string": str, "integer": int, "number": float, "boolean": bool, "array": list, "object": dict}
+
+
+def _shape(schema):
+    """(properties, required names, extras allowed) from an input schema, tolerating the odd
+    but valid ones: boolean property schemas, a "required" that isn't a list of names."""
+    schema = schema if isinstance(schema, dict) else {}
+    raw = schema.get("properties")
+    props = {n: (v if isinstance(v, dict) else {}) for n, v in (raw.items() if isinstance(raw, dict) else ())
+             if isinstance(n, str)}
+    required = schema.get("required")
+    required = [n for n in required if isinstance(n, str)] if isinstance(required, list) else []
+    for name in required:
+        props.setdefault(name, {})
+    extras = schema.get("additionalProperties")
+    # Extra arguments only when the schema explicitly allows them, or declares no properties at
+    # all. Many servers leave out additionalProperties; accepting anything there would let a
+    # hallucinated argument slip through, where the server may silently ignore it.
+    allowed = extras is True or isinstance(extras, dict) or (not props and extras is not False)
+    return props, set(required), allowed
+
+
+def _validator(schema, tool):
+    """Argument checks for a schema whose names can't be Python parameters ("from", "user-id"):
+    the same rules a signature would enforce, by name."""
+    props, required, allowed = _shape(schema)
+
+    def validate(args):
+        unknown = sorted(set(args) - props.keys())
+        if unknown and not allowed:
+            raise TypeError(f"{tool} got unexpected arguments {unknown}")
+        missing = sorted(required - set(args))
+        if missing:
+            raise TypeError(f"{tool} is missing required arguments {missing}")
+    return validate
 
 
 def _signature(schema):
     """A keyword-only Python signature for a JSON input schema, or None if the property names
     aren't valid Python identifiers."""
-    schema = schema or {}
-    props = dict(schema.get("properties") or {})
-    for name in schema.get("required") or []:
-        props.setdefault(name, {})
+    props, required, allowed = _shape(schema)
     if not all(n.isidentifier() and not keyword.iskeyword(n) for n in props):
         return None
-    required = set(schema.get("required") or [])
 
     def annotation(name):
         t = (props[name] or {}).get("type")
@@ -50,12 +81,9 @@ def _signature(schema):
     kw = inspect.Parameter.KEYWORD_ONLY
     params = [inspect.Parameter(n, kw, annotation=annotation(n)) for n in props if n in required]
     params += [inspect.Parameter(n, kw, default=UNSET, annotation=annotation(n)) for n in props if n not in required]
-    # Extra arguments only when the schema explicitly allows them, or declares no properties at
-    # all. Many servers leave out additionalProperties; accepting anything there would let a
-    # hallucinated argument slip through, where the server may silently ignore it.
-    extras = schema.get("additionalProperties")
-    if extras is True or isinstance(extras, dict) or (not props and extras is not False):
-        extra = next(n for n in ("extra", "extra_args", "_extra") if n not in props)
+    if allowed:
+        extra = next(n for n in ("extra", "extra_args", *(f"_extra{i}" for i in range(len(props) + 1)))
+                     if n not in props)
         params.append(inspect.Parameter(extra, inspect.Parameter.VAR_KEYWORD))
     return inspect.Signature(params)
 
@@ -93,6 +121,8 @@ async def list_all_tools(session):
         if not cursor or cursor in seen:  # guard against a server repeating a cursor
             return tools
         seen.add(cursor)
+        if len(seen) >= _MAX_PAGES:  # or handing out new ones forever
+            raise RuntimeError(f"the server's tool list did not end after {_MAX_PAGES} pages")
 
 
 async def register_mcp(session, *, prefix="", trust_readonly=False, undo=None, checks=None,
@@ -109,9 +139,10 @@ async def register_mcp(session, *, prefix="", trust_readonly=False, undo=None, c
         r = await session.call_tool(name, args)
         content = r.content or []
         text = "\n".join(c.text for c in content if getattr(c, "text", None) is not None)
-        if _field(r, "is_error", "isError"):
-            raise RuntimeError(f"{name}: {text}")
         structured = _field(r, "structured_content", "structuredContent")
+        if _field(r, "is_error", "isError"):
+            detail = text or (json.dumps(structured, default=repr) if structured is not None else "")
+            raise RuntimeError(f"{name}: {detail or 'the server reported an error'}")
         if structured is not None:
             return structured
         if not text and content:  # images, audio, resources: return them instead of ""
@@ -119,14 +150,18 @@ async def register_mcp(session, *, prefix="", trust_readonly=False, undo=None, c
                     for c in content]
         try:  # many servers return JSON as plain text; "NaN"/"Infinity" stay text
             return json.loads(text, parse_constant=_not_json)
-        except ValueError:
-            return text
+        except (ValueError, RecursionError):  # not JSON, or nested too deeply to read: the call
+            return text  # still succeeded, so its result must not look like a failure
 
     def proxy(name, description, schema):
         sig = _signature(schema)
+        validate = _validator(schema, prefix + name) if sig is None else None
 
         async def fn(*a, **k):
             if sig is None:
+                if a:
+                    raise TypeError(f"{prefix + name} takes its arguments by name")
+                validate(k)
                 return await call(name, **k)
             bound = sig.bind(*a, **k)
             args = {}
@@ -139,7 +174,9 @@ async def register_mcp(session, *, prefix="", trust_readonly=False, undo=None, c
 
         fn.__name__ = fn.__qualname__ = prefix + name
         fn.__doc__, fn.input_schema = description, schema
-        if sig is not None:
+        if sig is None:
+            fn.validate_args = validate  # order() runs it, so a bad plan is refused before it starts
+        else:
             fn.__signature__ = sig
             fn.__annotations__ = {p.name: p.annotation for p in sig.parameters.values()
                                   if p.annotation is not inspect.Parameter.empty}
@@ -147,13 +184,20 @@ async def register_mcp(session, *, prefix="", trust_readonly=False, undo=None, c
 
     server_tools = await list_all_tools(session)
     names = {t.name for t in server_tools}
+    if len(names) != len(server_tools):  # one name, two labels: which one is true is unknowable
+        seen, twice = set(), set()
+        for t in server_tools:
+            (twice if t.name in seen else seen).add(t.name)
+        raise ValueError(f"the server lists these tools more than once: {sorted(twice)}")
     unknown = sorted((undo.keys() | checks.keys()) - names)
     if unknown:  # a typo here would silently leave a tool without its undo or check
         raise ValueError(f"undo/checks name tools the server does not have: {unknown}")
 
     for t in server_tools:
         ann = t.annotations
-        readonly = bool(ann and _field(ann, "read_only_hint", "readOnlyHint"))
+        # a tool claimed both read-only and destructive is treated as what costs least if wrong
+        readonly = bool(ann and _field(ann, "read_only_hint", "readOnlyHint")
+                        and not _field(ann, "destructive_hint", "destructiveHint"))
         u = undo.get(t.name) or (NOOP if readonly and trust_readonly else None)
         fn = proxy(t.name, t.description, _field(t, "input_schema", "inputSchema"))
         reg[prefix + t.name] = Tool(fn, u, checks.get(t.name))
@@ -233,7 +277,7 @@ if __name__ == "__main__":
         db["outbox"].append((to, cc))
         return "sent"
 
-    def plan(flight="AI101", to="me@x.com"):  # naive order: cancel first
+    def plan(flight="AI101", to="me@example.com"):  # naive order: cancel first
         return [
             {"id": "cancel", "tool": "cancel_booking", "args": {"ref": "OLD1"}},
             {"id": "find", "tool": "search", "args": {"route": "BLR-DEL"}},
@@ -338,7 +382,7 @@ if __name__ == "__main__":
 
             # Happy path.
             await arun(plan(), registry=reg, log=quiet)
-            assert db["bookings"] == [] and db["holds"] == ["AI101"] and db["outbox"] == ["me@x.com"]
+            assert db["bookings"] == [] and db["holds"] == ["AI101"] and db["outbox"] == ["me@example.com"]
 
     asyncio.run(main())
 
@@ -425,6 +469,96 @@ if __name__ == "__main__":
                     return await inner(**kw)
             return Callable()
     assert [t.name for t in asyncio.run(list_all_tools(Opaque()))] == ["a", "b", "c", "d"]
+
+    # Odd but valid schemas, hostile servers and contradictory hints (independent audit, 0.8.6).
+    def expect(exc, fn, *a, **k):
+        try:
+            fn(*a, **k)
+        except exc as e:
+            return e
+        raise AssertionError(f"expected {exc.__name__}")
+
+    class Server:
+        def __init__(self, tools, result=None):
+            self.tools, self.result, self.sent = tools, result, []
+
+        async def list_tools(self):
+            return NS(tools=self.tools, nextCursor=None)
+
+        async def call_tool(self, name, args):
+            self.sent.append((name, args))
+            return self.result or NS(content=[NS(text="ok")], isError=False, structuredContent=None)
+
+    def spec(name, schema=None, ro=None, destructive=None):
+        ann = None if ro is None else ToolAnnotations(readOnlyHint=ro, destructiveHint=destructive)
+        return NS(name=name, description="", annotations=ann, inputSchema=schema)
+
+    # names that can't be Python parameters are still checked, before anything runs
+    mail = Server([spec("send", {"type": "object", "properties": {"from": {"type": "string"},
+                                                                   "to": {"type": "string"}},
+                                 "required": ["to"], "additionalProperties": False})])
+    odd = {}
+    asyncio.run(register_mcp(mail, registry=odd))
+    for bad in ({"to": "a@example.com", "bcc": "everyone@example.com"}, {"from": "x"}):
+        expect(ValueError, order, [{"id": "s", "tool": "send", "args": bad}], odd)
+    assert asyncio.run(arun([{"id": "s", "tool": "send", "args": {"from": "me", "to": "you"}}],
+                            registry=odd, log=lambda m: None)) == {"s": "ok"}
+    assert mail.sent == [("send", {"from": "me", "to": "you"})]
+    from rubicon import Transaction as _Tx
+    try:
+        asyncio.run(_Tx(registry=odd, log=lambda m: None).acall("send", to="you", bcc="everyone@example.com"))
+        raise AssertionError("a Transaction call must check the names too")
+    except TypeError:
+        assert len(mail.sent) == 1  # nothing was sent
+    try:
+        asyncio.run(odd["send"].fn("positional"))
+        raise AssertionError("positional arguments must be refused")
+    except TypeError:
+        pass
+
+    # boolean property schemas, a "required" that isn't a list, and taken **extra names
+    weird = Server([spec("b", {"properties": {"a": True}}), spec("r", {"required": "flight"}),
+                    spec("e", {"properties": {"extra": {}, "extra_args": {}, "_extra": {}},
+                               "additionalProperties": True})])
+    asyncio.run(register_mcp(weird, registry={}))
+    assert str(_signature({"required": "flight"})) == "(**extra)"
+    assert "**_extra0" in str(_signature({"properties": {"extra": {}, "extra_args": {}, "_extra": {}},
+                                          "additionalProperties": True}))
+
+    # a tool listed twice can't be labelled reliably: refused
+    expect(ValueError, lambda: asyncio.run(register_mcp(Server([spec("t", ro=True), spec("t", ro=False)]),
+                                                        registry={}, trust_readonly=True)))
+
+    # read-only and destructive at once: treated as permanent
+    hints = {}
+    asyncio.run(register_mcp(Server([spec("both", ro=True, destructive=True), spec("ro", ro=True)]),
+                             registry=hints, trust_readonly=True))
+    assert not hints["both"].reversible and hints["ro"].reversible
+
+    # an error result with only structured content keeps its message
+    failing = Server([spec("q")], NS(content=[], isError=True, structuredContent={"error": "quota exceeded"}))
+    call = asyncio.run(register_mcp(failing, registry={}))
+    try:
+        asyncio.run(call("q"))
+        raise AssertionError("an error result must raise")
+    except RuntimeError as e:
+        assert "quota exceeded" in str(e)
+
+    # a successful call whose text is nested too deeply to parse is still a success
+    deep = Server([spec("d")], NS(content=[NS(text="[" * 5000 + "]" * 5000)], isError=False, structuredContent=None))
+    call = asyncio.run(register_mcp(deep, registry={}))
+    assert asyncio.run(call("d")).startswith("[[[")
+
+    # a server that hands out new cursors forever is stopped
+    class Endless:
+        def __init__(self):
+            self.n = 0
+
+        async def list_tools(self, cursor=None):
+            self.n += 1
+            return NS(tools=[], nextCursor=f"c{self.n}")
+
+    expect(RuntimeError, lambda: asyncio.run(list_all_tools(Endless())))
     tempfile.tempdir = previous_tempdir
     scratch.cleanup()
     print("all MCP checks passed")
