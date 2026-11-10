@@ -17,3 +17,10 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Test artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.benchmarks/

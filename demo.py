@@ -17,7 +17,9 @@ if env.exists():
     for line in env.read_text(encoding="utf-8").splitlines():
         if "=" in line and not line.lstrip().startswith("#"):
             k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+            v = v.strip().strip('"').strip("'")
+            if v:  # a blank "KEY=" line from .env.example must not hide a key set elsewhere
+                os.environ.setdefault(k.strip(), v)
 
 from rubicon import NOOP, PlanFailed, run, tool
 from rubicon_llm import ask_human, plan_with_claude, plan_with_gemini, plan_with_openai
