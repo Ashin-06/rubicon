@@ -1,5 +1,91 @@
 # Changelog
 
+## 0.8.6 - 2026-11-10
+
+Three independent audits (core concurrency and crashes; untrusted model output, signatures and
+MCP; docs and packaging) plus an external review. Every fix below has a check that fails
+without it.
+
+### Fixed: crash safety and concurrency
+- `compact()` could delete the next stage of a live `Transaction`: it read the journal, then
+  dropped every record of the settled transactions, including records written in between. It
+  now drops only the records it read (`drop(tx_ids, upto=...)` on both built-in journals).
+- A line torn by a power cut or a full disk swallowed the next record in a `FileJournal`, which
+  could make `recover()` undo what an in-flight permanent step relied on. A torn line is now
+  ended before the next record is written.
+- A `recover()` in the same process could undo a transaction that had just committed: the
+  transaction left the in-process live set before its closing record was durable, and joined it
+  only after its first record. Both orders are fixed, and `recover()` re-reads the journal before
+  judging a transaction of its own process.
+- `acknowledge(journal, tx)` settled a stage the worker started after the crash report. It now
+  settles only what recovery kept or found in flight at that point.
+- A journal write that failed during a rollback stopped the rollback, replaced the real error,
+  and could report a step as both undone and failed. Every undo is now attempted, each step is
+  reported once, and the tool's own error is kept.
+- A step running on another thread when the transaction was rolled back stayed in place. It now
+  undoes itself when it finishes.
+- A step could be marked running only after its "started" record was written, so a settle on
+  another thread could miss it. The order is now reversed.
+- `with Transaction()` used from sync code on an event loop's thread could neither commit nor
+  roll back. Commit and rollback now work there like `call()`.
+- An async tool called from sync code inside a running loop ran up to its first `await`, then
+  was abandoned without a trace. It is now refused before any of it runs.
+- On Windows, a worker that exited with code 259 looked alive to `recover()` forever.
+- A result with a cycle or very deep nesting failed the step, even without a journal. Such
+  values are now marked in the journal, and nothing is copied when there is no journal.
+- `on_dead_letter` was never called for dead letters recorded by a rollback in `run()` or a
+  `Transaction`. `recover()` now passes every dead letter to it once.
+
+### Fixed: plans and model output
+- An answer containing two different plans ran the first one. It is now rejected as ambiguous.
+- Deeply nested model output or arguments raised `RecursionError` instead of `PlanRejected`.
+- Some short malformed answers took tens of seconds to reject; parsing is now linear.
+- A step field under another name (`arguments`, `depends_on`) was silently dropped, so a tool ran
+  without its arguments or before its dependency. Common names are now read as `args` and
+  `after` (a repair), and refused with `repair=False`.
+- `agent()` retried any `ValueError`, such as a missing API key, and sent its text to the model.
+  Only rejected plans are retried now.
+- `aagent()` took an async confirm reached through a lambda or an object for a yes without
+  awaiting it. Its answer is now awaited, and so is a planner reached the same way.
+- `args_json` written as the text `"null"` replaced valid `args`.
+- Python-style model output could print a `SyntaxWarning`.
+- `plan_with_openai` accepted any `json_mode`; it now raises for an unknown one.
+- Model names from `GEMINI_MODEL` and `CLAUDE_MODEL` are stripped of spaces.
+
+### Fixed: arguments and tools
+- Argument names that aren't strings raised `TypeError` instead of a clear `ValueError`.
+- A positional-only parameter or `*args` after an `UNSET` default failed at call time, after the
+  plan had been accepted. Such calls are now bound correctly, or rejected at plan time.
+- A reference path into an object that isn't a dict or list (`$hold.seat` on a dataclass)
+  inserted the object's text. It is now a bad reference.
+- An undo with an option of its own, such as `undo(result, force=False)`, received the step's
+  arguments as `force`. A second parameter with a default is now left alone (unless it is named
+  `args`).
+- Tool descriptions lost the type hints of `functools.partial` objects and callable objects.
+- `order()` took quadratic time on large plans.
+- Registering a sync tool with `timeout=` now logs a warning, as the timeout can't apply.
+- `run()` now shows its real keyword arguments instead of `**kwargs`.
+
+### Fixed: MCP
+- One property name that can't be a Python parameter (`"from"`, `"user-id"`) turned off all
+  argument checks for that tool. Such tools are now checked by name against their schema, both
+  in plans and in `Transaction` calls.
+- Some valid schemas (boolean property schemas, a `required` that isn't a list, properties
+  named `extra`, `extra_args` and `_extra`) crashed `register_mcp` for the whole server.
+- A server listing one tool name twice is refused, so no tool ends up with the wrong label.
+- A tool claimed both read-only and destructive is now treated as permanent.
+- An error result with only structured content lost its message.
+- A successful call whose text was nested too deeply to parse looked like a failure.
+- A server handing out new pagination cursors forever is stopped after 1000 pages.
+
+### Docs and packaging
+- README rewritten for new users: a runnable quick start, a glossary, when to use it and when
+  not, a comparison, troubleshooting, a runnable MCP example, and the API details that were
+  missing (`Tool`, `SYSTEM`, `Transaction.id`, step ids, the custom journal contract).
+- CONTRIBUTING.md and SECURITY.md added; package metadata completed; CI adds Python 3.14 and a
+  job that builds the package and runs the self-checks from the installed wheel.
+- Example addresses use example.com.
+
 ## 0.8.5
 
 ### Fixed
