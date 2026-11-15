@@ -59,64 +59,297 @@ def expect(exc, fn, *a, **k):
     raise AssertionError(f"expected {exc.__name__}")
 
 
+# ---------------------------------------------------------------- shared worlds
+
+db = {"bookings": {"OLD1"}, "holds": [], "seats": {"AI101": 1}, "outbox": [], "smtp_down": False}
+
+
+@tool(undo=NOOP)
+
+def search(route: str) -> list:
+    """Find flights with free seats."""
+    return [f for f, n in db["seats"].items() if n > 0]
+
+
+def release(hold):
+    db["holds"].remove(hold["flight"])
+    db["seats"][hold["flight"]] += 1
+
+
+@tool(undo=release)
+
+def book_flight(flight: str, note: str = "") -> dict:
+    """Hold a seat (can be released)."""
+    if db["seats"].get(flight, 0) < 1:
+        raise RuntimeError(f"no seats on {flight}")
+    db["seats"][flight] -= 1
+    db["holds"].append(flight)
+    return {"flight": flight}
+
+
+def must_exist(ref):
+    if ref not in db["bookings"]:
+        raise RuntimeError(f"no booking {ref}")
+    return f"will cancel {ref}"
+
+
+@tool(check=must_exist)
+
+def cancel_booking(ref: str):
+    """Cancel a booking. PERMANENT."""
+    db["bookings"].remove(ref)
+
+
+def valid_to(to, body):
+    if "@" not in to:
+        raise RuntimeError(f"bad address {to}")
+
+
+@tool(check=valid_to)
+
+def send_email(to: str, body: str):
+    """Send an email. PERMANENT."""
+    if db["smtp_down"]:
+        raise ConnectionError("SMTP timeout")
+    db["outbox"].append((to, body))
+
+
+def plan(flight="AI101", to="me@example.com"):
+    return [
+        {"id": "cancel", "tool": "cancel_booking", "args": {"ref": "OLD1"}},
+        {"id": "find", "tool": "search", "args": {"route": "BLR-DEL"}},
+        {"id": "hold", "tool": "book_flight", "args": {"flight": flight}},
+        {"id": "mail", "tool": "send_email", "args": {"to": to, "body": "held $hold.flight"}},
+    ]
+
+
+def reset():
+    db.update(bookings={"OLD1"}, holds=[], seats={"AI101": 1}, outbox=[], smtp_down=False)
+
+
+def clean():
+    return db["bookings"] == {"OLD1"} and db["seats"]["AI101"] == 1 and not db["holds"]
+
+
+reg, log2 = {}, []
+
+
+async def aundo(r):
+    log2.append(("undo", r))
+
+
+async def acheck(x):
+    if x < 0:
+        raise ValueError("negative")
+
+live = {"now": 0, "peak": 0}
+
+
+@tool(undo=aundo, registry=reg)
+
+async def reserve(x: int) -> int:
+    """Async undoable tool."""
+    live["now"] += 1
+    live["peak"] = max(live["peak"], live["now"])
+    try:
+        await asyncio.sleep(0.05)
+        if x == 99:
+            raise RuntimeError("boom")
+        return x * 2
+    finally:
+        live["now"] -= 1
+
+
+@tool(check=acheck, registry=reg)
+
+async def charge(x: int):
+    """Async permanent tool."""
+    log2.append(("charge", x))
+
+
+odd, got = {}, []
+
+
+@tool(undo=NOOP, registry=odd)
+
+def varargs(x, *items, **kw):
+    got.append((x, items, kw))
+
+
+def cc_check(to, cc):
+    got.append(("check", to, cc))
+
+
+@tool(check=cc_check, registry=odd)
+
+def mail(to, cc="none"):
+    pass
+tool(len, name="length", undo=NOOP, registry=odd)
+
+
+outage = {"down": True, "calls": []}
+
+
+def undo_b(r):
+    outage["calls"].append(r)
+    if outage["down"]:
+        raise ConnectionError("service down")
+
+
+@tool(undo=lambda r: outage["calls"].append(r), registry=odd)
+
+def part_a():
+    return "a"
+
+
+@tool(undo=undo_b, undo_retries=0, registry=odd)
+
+def part_b():
+    return "b"
+
+
+# a real crash (the process dies) in the middle of a step
+here = os.path.dirname(os.path.abspath(rubicon.__file__))
+
+
+def crash_run(dies_in, journal_path):
+    child = (
+        "import os, sys\n"
+        f"sys.path.insert(0, {here!r})\n"
+        "from rubicon import APPROVE_ALL, tool, run, NOOP\n"
+        "reg = {}\n"
+        "tool(lambda flight: {'flight': flight}, name='hold', undo=NOOP, registry=reg)\n"
+        f"tool(lambda: os._exit(3) if {dies_in!r} == 'probe' else 'x', name='probe', undo=NOOP, registry=reg)\n"
+        f"tool(lambda ref: os._exit(3) if {dies_in!r} == 'cancel' else 'ok', name='cancel', registry=reg)\n"
+        "run([{'id': 'h', 'tool': 'hold', 'args': {'flight': 'AI101'}},\n"
+        "     {'id': 'p', 'tool': 'probe', 'after': ['h']},\n"
+        "     {'id': 'c', 'tool': 'cancel', 'args': {'ref': 'OLD1'}}],\n"
+        f"    registry=reg, journal={journal_path!r}, log=lambda m: None, confirm=APPROVE_ALL)\n")
+    assert subprocess.run([sys.executable, "-c", child]).returncode == 3
+
+released = []
+after_crash = {}
+tool(lambda flight: None, name="hold", undo=lambda r: released.append(r), registry=after_crash)
+tool(lambda: None, name="probe", undo=NOOP, registry=after_crash)
+tool(lambda ref: None, name="cancel", registry=after_crash)
+
+
+owed = {"down": True, "undone": []}
+
+
+def release_owed(r):
+    if owed["down"]:
+        raise ConnectionError("down")
+    owed["undone"].append(r)
+
+
+@tool(undo=release_owed, undo_retries=0, registry=odd)
+
+def take():
+    return "seat"
+
+
+@tool(registry=odd)
+
+def break_commit():
+    raise RuntimeError("permanent step failed")
+
+
+@tool(undo=NOOP, registry=odd)
+
+def make_hold():
+    return {"flight": "AI101"}
+
+
+@tool(registry=odd)
+
+def do_cancel():
+    return "ok"
+
+
+@tool(registry=odd)
+
+def notify(flight: str, note: str = "", channel: str = "email"):
+    return "sent"
+
+
+def crash_with(journal):
+    tx = Transaction(registry=odd, journal=journal, log=quiet, confirm=APPROVE_ALL)
+    tx.call("part_a")
+    tx.call("make_hold")
+    crashed(tx)
+    return tx.id
+
+
+class MemoryJournal:  # what a Redis/Postgres-backed journal needs to provide
+    def __init__(self):
+        self.rows = []
+
+    def append(self, records):
+        self.rows.extend(json.loads(json.dumps(r, default=repr)) for r in records)
+
+    def records(self):
+        return list(self.rows)
+
+
+class OtherProcess:
+    """The journal as another worker sees it: this process is a live process it can't look
+    inside (its pid is swapped for the parent's), and nothing is in that worker's _LIVE."""
+
+    def __init__(self, path):
+        self.j = FileJournal(path)
+
+    def append(self, records):
+        self.j.append(records)
+
+    def records(self):
+        return [{**r, "pid": os.getppid()} if "pid" in r else r for r in self.j.records()]
+
+    def drop(self, tx_ids):
+        self.j.drop(tx_ids)
+
+
+@contextlib.contextmanager
+
+def from_other_process(path):
+    hidden = set(_LIVE)
+    _LIVE.clear()
+    try:
+        yield OtherProcess(path)
+    finally:
+        _LIVE.update(hidden)
+
+stage = {}
+stage_undone = []
+tool(lambda: "a", name="sa", undo=lambda r: stage_undone.append("a"), registry=stage)
+tool(lambda: "b", name="sb", undo=lambda r: stage_undone.append("b"), registry=stage)
+tool(lambda: 1 / 0, name="sbroken", undo=NOOP, registry=stage)
+tool(lambda: "c", name="sc", undo=lambda r: 1 / 0, undo_retries=0, registry=stage)
+tool(lambda: "p", name="sp", registry=stage)
+
+
+world6 = set()
+reg6 = {}
+tool(lambda k: world6.add(k) or k, name="put", undo=lambda r: world6.discard(r), registry=reg6)
+tool(lambda: "p", name="perm", registry=reg6)
+
+@pytest.fixture(autouse=True)
+def _fresh_world():
+    """Every test starts from the same world, whatever ran before it."""
+    reset()
+    log2.clear()
+    live.update(now=0, peak=0)
+    got.clear()
+    outage.update(down=True, calls=[])
+    owed.update(down=True, undone=[])
+    released.clear()
+    stage_undone.clear()
+    world6.clear()
+
+
+
 def test_rebooking_scenario():
-    global clean, db, plan, release, reset
     # --- rebooking scenario: the classic agent mistake is cancelling first ---
-    db = {"bookings": {"OLD1"}, "holds": [], "seats": {"AI101": 1}, "outbox": [], "smtp_down": False}
-
-    @tool(undo=NOOP)
-    def search(route: str) -> list:
-        """Find flights with free seats."""
-        return [f for f, n in db["seats"].items() if n > 0]
-
-    def release(hold):
-        db["holds"].remove(hold["flight"])
-        db["seats"][hold["flight"]] += 1
-
-    @tool(undo=release)
-    def book_flight(flight: str, note: str = "") -> dict:
-        """Hold a seat (can be released)."""
-        if db["seats"].get(flight, 0) < 1:
-            raise RuntimeError(f"no seats on {flight}")
-        db["seats"][flight] -= 1
-        db["holds"].append(flight)
-        return {"flight": flight}
-
-    def must_exist(ref):
-        if ref not in db["bookings"]:
-            raise RuntimeError(f"no booking {ref}")
-        return f"will cancel {ref}"
-
-    @tool(check=must_exist)
-    def cancel_booking(ref: str):
-        """Cancel a booking. PERMANENT."""
-        db["bookings"].remove(ref)
-
-    def valid_to(to, body):
-        if "@" not in to:
-            raise RuntimeError(f"bad address {to}")
-
-    @tool(check=valid_to)
-    def send_email(to: str, body: str):
-        """Send an email. PERMANENT."""
-        if db["smtp_down"]:
-            raise ConnectionError("SMTP timeout")
-        db["outbox"].append((to, body))
-
-    def plan(flight="AI101", to="me@example.com"):
-        return [
-            {"id": "cancel", "tool": "cancel_booking", "args": {"ref": "OLD1"}},
-            {"id": "find", "tool": "search", "args": {"route": "BLR-DEL"}},
-            {"id": "hold", "tool": "book_flight", "args": {"flight": flight}},
-            {"id": "mail", "tool": "send_email", "args": {"to": to, "body": "held $hold.flight"}},
-        ]
-
-    def reset():
-        db.update(bookings={"OLD1"}, holds=[], seats={"AI101": 1}, outbox=[], smtp_down=False)
-
-    def clean():
-        return db["bookings"] == {"OLD1"} and db["seats"]["AI101"] == 1 and not db["holds"]
-
     assert [s["id"] for s in order(plan())] == ["find", "hold", "cancel", "mail"]
 
 
@@ -151,21 +384,18 @@ def test_malformed_plans_and_mismatched_arguments_are_rejected():
 
 
 def test_no_seats():
-    global e
     # 1. no seats -> old booking survives, nothing committed
     e = expect(PlanFailed, run, plan(flight="XX9"), log=quiet, confirm=APPROVE_ALL)
     assert e.step == "hold" and e.committed == [] and e.not_run == ["cancel", "mail"] and clean()
 
 
 def test_dry_run_blocks():
-    global e
     # 2. dry-run blocks -> seat released, nothing permanent happened
     e = expect(PlanFailed, run, plan(to="not-an-email"), log=quiet, confirm=APPROVE_ALL)
     assert e.step == "mail" and e.undone == ["hold", "find"] and clean()
 
 
 def test_human_declines():
-    global e, seen
     # 3. human declines; confirm sees only permanent steps, resolved args and previews
     seen = []
     e = expect(PlanFailed, run, plan(), confirm=lambda st: seen.extend(st) or False, log=quiet)
@@ -174,7 +404,6 @@ def test_human_declines():
 
 
 def test_permanent_failure_after_commit_keeps_the_hold():
-    global e
     # 4. CRITICAL: a permanent step fails after another committed -> the hold it relies on stays
     db["smtp_down"] = True
     e = expect(PlanFailed, run, plan(), log=quiet, confirm=APPROVE_ALL)
@@ -193,7 +422,6 @@ def test_ctrl_c_mid_run_still_unwinds_then_propagates():
 
 
 def test_an_undo_that_keeps_failing_is_retried_reported_and():
-    global e
     # 6. an undo that keeps failing is retried, reported, and unwinding continues
     calls = []
     @tool(undo=lambda r: calls.append(1) or 1 / 0, undo_retries=1)
@@ -204,7 +432,6 @@ def test_an_undo_that_keeps_failing_is_retried_reported_and():
 
 
 def test_dry_runs_wait_for_after_dependencies_not_just_references():
-    global e
     # 7. dry runs wait for `after` dependencies, not just $references
     made = set()
 
@@ -229,7 +456,6 @@ def test_dry_runs_wait_for_after_dependencies_not_just_references():
 
 
 def test_happy_path_with_structured_events():
-    global events, r
     # 9. happy path, with structured events
     events = []
     r = run(plan(), log=quiet, on_event=events.append, confirm=APPROVE_ALL)
@@ -242,7 +468,6 @@ def test_happy_path_with_structured_events():
 
 
 def test_undo_receives_the_call_s_arguments_when_it_asks_for_them():
-    global e
     # --- undo receives the call's arguments when it asks for them ---
     files = {}
 
@@ -274,37 +499,7 @@ def test_retries_and_timeouts():
 
 
 def test_async_tools_async_undo_check_confirm_isolated_registry():
-    global e, log2, p, reg
     # --- async tools, async undo/check/confirm, isolated registry, parallel waves ---
-    reg, log2 = {}, []
-
-    async def aundo(r):
-        log2.append(("undo", r))
-
-    async def acheck(x):
-        if x < 0:
-            raise ValueError("negative")
-
-    live = {"now": 0, "peak": 0}
-
-    @tool(undo=aundo, registry=reg)
-    async def reserve(x: int) -> int:
-        """Async undoable tool."""
-        live["now"] += 1
-        live["peak"] = max(live["peak"], live["now"])
-        try:
-            await asyncio.sleep(0.05)
-            if x == 99:
-                raise RuntimeError("boom")
-            return x * 2
-        finally:
-            live["now"] -= 1
-
-    @tool(check=acheck, registry=reg)
-    async def charge(x: int):
-        """Async permanent tool."""
-        log2.append(("charge", x))
-
     async def aconfirm(steps):
         return True
 
@@ -333,7 +528,6 @@ def test_async_tools_async_undo_check_confirm_isolated_registry():
 
 
 def test_transaction_guards_an_agent_loop():
-    global e, hold, tx
     # --- Transaction: guard an agent loop that calls tools one by one ---
     with Transaction(log=quiet, confirm=APPROVE_ALL) as tx:
         hold = tx.wrap("book_flight")
@@ -363,7 +557,6 @@ def test_transaction_guards_an_agent_loop():
 
 
 def test_transaction_failing_permanent_step_after_commit():
-    global e, tx
     # Transaction: a failing permanent step after a commit keeps the earlier state
     db["smtp_down"] = True
     tx = Transaction(log=quiet, confirm=APPROVE_ALL)
@@ -376,21 +569,7 @@ def test_transaction_failing_permanent_step_after_commit():
 
 
 def test_wrap_passes_args_kwargs_and_defaults_to_checks():
-    global got, odd, tx
     # wrap(): *args, **kwargs, positional-only, defaults reaching the check
-    odd, got = {}, []
-
-    @tool(undo=NOOP, registry=odd)
-    def varargs(x, *items, **kw):
-        got.append((x, items, kw))
-
-    def cc_check(to, cc):
-        got.append(("check", to, cc))
-
-    @tool(check=cc_check, registry=odd)
-    def mail(to, cc="none"):
-        pass
-    tool(len, name="length", undo=NOOP, registry=odd)
     with Transaction(registry=odd, log=quiet, confirm=APPROVE_ALL) as tx:
         tx.wrap("varargs")(1, 2, 3, y=4)
         assert tx.wrap("length")([1, 2]) == 2
@@ -416,7 +595,6 @@ def test_async_framework_runs_sync_tools_on_its_loop():
 
 
 def test_rollback_keeps_unwinding_through_an_interruption_then_re():
-    global tx
     # rollback keeps unwinding through an interruption, then re-raises it
     order_undone = []
 
@@ -439,7 +617,6 @@ def test_rollback_keeps_unwinding_through_an_interruption_then_re():
 
 
 def test_journal_and_crash_recovery():
-    global path, tx
     # --- journal and crash recovery ---
     path = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
     tx = Transaction(journal=path, log=quiet, confirm=APPROVE_ALL)
@@ -480,7 +657,6 @@ def test_cancelling_a_parallel_run_stops_the_wave_first_so_no():
 
 
 def test_a_check_only_receives_the_parameters_it_asks_for():
-    global tx
     # a check only receives the parameters it asks for; UNSET parameters are left out entirely
     checked = []
 
@@ -514,23 +690,8 @@ def test_journal_marks_only_unserializable_values():
 
 
 def test_recovery_journals_each_undo_so_it_can_be_re_run_without():
-    global first, outage, path2, second, tx
     # recovery journals each undo, so it can be re-run without undoing anything twice
     path2 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
-    outage = {"down": True, "calls": []}
-
-    def undo_b(r):
-        outage["calls"].append(r)
-        if outage["down"]:
-            raise ConnectionError("service down")
-
-    @tool(undo=lambda r: outage["calls"].append(r), registry=odd)
-    def part_a():
-        return "a"
-
-    @tool(undo=undo_b, undo_retries=0, registry=odd)
-    def part_b():
-        return "b"
     tx = Transaction(registry=odd, journal=path2, log=quiet, confirm=APPROVE_ALL)
     tx.call("part_a")
     tx.call("part_b")
@@ -545,8 +706,8 @@ def test_recovery_journals_each_undo_so_it_can_be_re_run_without():
 
 
 def test_an_in_process_rollback_whose_undo_fails_leaves_the():
-    global tx
     # an in-process rollback whose undo fails leaves the journal open for recover() to retry
+    path2 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
     outage.update(down=True, calls=[])
     tx = Transaction(registry=odd, journal=path2, log=quiet, confirm=APPROVE_ALL)
     tx.call("part_b")
@@ -557,7 +718,6 @@ def test_an_in_process_rollback_whose_undo_fails_leaves_the():
 
 
 def test_recover_also_covers_a_transaction_that_committed_in():
-    global tx
     # recover() also covers a Transaction that committed in stages and crashed in a later stage
     path3 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
     outage.update(down=False, calls=[])
@@ -571,7 +731,6 @@ def test_recover_also_covers_a_transaction_that_committed_in():
 
 
 def test_a_step_that_cancels_itself_inside_a_parallel_wave_is_a():
-    global e
     # a step that cancels itself inside a parallel wave is a failure, not a finished step
     @tool(undo=NOOP, registry=reg)
     async def self_cancel():
@@ -599,7 +758,6 @@ def test_a_sync_tool_s_retries_also_work_through_tx_call_inside_a():
 
 
 def test_a_broken_on_event_or_log_callback_never_changes_what():
-    global warned
     # a broken on_event or log callback never changes what runs or gets undone
     def broken(*a):
         raise RuntimeError("logging backend down")
@@ -610,35 +768,7 @@ def test_a_broken_on_event_or_log_callback_never_changes_what():
     reset()
 
 
-def test_a_real_crash_the_process_dies_in_the_middle_of_a_step():
-    global after_crash, crash_run, here, released
-    # a real crash (the process dies) in the middle of a step
-    here = os.path.dirname(os.path.abspath(rubicon.__file__))
-
-    def crash_run(dies_in, journal_path):
-        child = (
-            "import os, sys\n"
-            f"sys.path.insert(0, {here!r})\n"
-            "from rubicon import APPROVE_ALL, tool, run, NOOP\n"
-            "reg = {}\n"
-            "tool(lambda flight: {'flight': flight}, name='hold', undo=NOOP, registry=reg)\n"
-            f"tool(lambda: os._exit(3) if {dies_in!r} == 'probe' else 'x', name='probe', undo=NOOP, registry=reg)\n"
-            f"tool(lambda ref: os._exit(3) if {dies_in!r} == 'cancel' else 'ok', name='cancel', registry=reg)\n"
-            "run([{'id': 'h', 'tool': 'hold', 'args': {'flight': 'AI101'}},\n"
-            "     {'id': 'p', 'tool': 'probe', 'after': ['h']},\n"
-            "     {'id': 'c', 'tool': 'cancel', 'args': {'ref': 'OLD1'}}],\n"
-            f"    registry=reg, journal={journal_path!r}, log=lambda m: None, confirm=APPROVE_ALL)\n")
-        assert subprocess.run([sys.executable, "-c", child]).returncode == 3
-
-    released = []
-    after_crash = {}
-    tool(lambda flight: None, name="hold", undo=lambda r: released.append(r), registry=after_crash)
-    tool(lambda: None, name="probe", undo=NOOP, registry=after_crash)
-    tool(lambda ref: None, name="cancel", registry=after_crash)
-
-
 def test_dies_during_the_permanent_cancel():
-    global rep
     # dies during the permanent cancel: it may have gone through, so the hold must be kept
     path4 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
     crash_run("cancel", path4)
@@ -648,7 +778,6 @@ def test_dies_during_the_permanent_cancel():
 
 
 def test_dies_during_an_undoable_step():
-    global rep
     # dies during an undoable step: completed steps are undone, the half-run one is reported
     path5 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
     crash_run("probe", path5)
@@ -658,23 +787,7 @@ def test_dies_during_an_undoable_step():
 
 
 def test_a_failed_undo_stays_owed_to_recover():
-    global owed, rep, tx
     # a failed undo stays owed to recover(): through a second rollback and through later commits
-    owed = {"down": True, "undone": []}
-
-    def release_owed(r):
-        if owed["down"]:
-            raise ConnectionError("down")
-        owed["undone"].append(r)
-
-    @tool(undo=release_owed, undo_retries=0, registry=odd)
-    def take():
-        return "seat"
-
-    @tool(registry=odd)
-    def break_commit():
-        raise RuntimeError("permanent step failed")
-
     path6 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
     try:
         with Transaction(registry=odd, journal=path6, log=quiet, confirm=APPROVE_ALL) as tx:
@@ -725,17 +838,6 @@ def test_the_confirmation_resolves_what_it_can_even_for_a_step():
     # the confirmation resolves what it can, even for a step that waits on another permanent step
     shown2 = []
 
-    @tool(undo=NOOP, registry=odd)
-    def make_hold():
-        return {"flight": "AI101"}
-
-    @tool(registry=odd)
-    def do_cancel():
-        return "ok"
-
-    @tool(registry=odd)
-    def notify(flight: str, note: str = "", channel: str = "email"):
-        return "sent"
     run([{"id": "h", "tool": "make_hold"}, {"id": "c", "tool": "do_cancel"},
          {"id": "n", "tool": "notify", "args": {"flight": "$h.flight", "note": "after $c"}, "after": ["c"]}],
         registry=odd, confirm=lambda st: shown2.extend(st) or True, log=quiet)
@@ -743,31 +845,13 @@ def test_the_confirmation_resolves_what_it_can_even_for_a_step():
 
 
 def test_sqlite_custom_and_concurrent_journals():
-    global MemoryJournal, crash_with, journal, rep, tx_id
     # --- journals: SQLite, custom stores, concurrent writers, recovery lock ---
-    def crash_with(journal):
-        tx = Transaction(registry=odd, journal=journal, log=quiet, confirm=APPROVE_ALL)
-        tx.call("part_a")
-        tx.call("make_hold")
-        crashed(tx)
-        return tx.id
-
     outage.update(down=False, calls=[])
     db_path = os.path.join(tempfile.mkdtemp(), "rubicon.db")
     tx_id = crash_with(SQLiteJournal(db_path))
     rep = recover(SQLiteJournal(db_path), registry=odd, log=quiet)
     assert rep[0]["tx"] == tx_id and rep[0]["undone"] == ["make_hold-2", "part_a-1"] and outage["calls"] == ["a"]
     assert recover(SQLiteJournal(db_path), registry=odd, log=quiet) == []
-
-    class MemoryJournal:  # what a Redis/Postgres-backed journal needs to provide
-        def __init__(self):
-            self.rows = []
-
-        def append(self, records):
-            self.rows.extend(json.loads(json.dumps(r, default=repr)) for r in records)
-
-        def records(self):
-            return list(self.rows)
 
     mem = MemoryJournal()
     outage.update(calls=[])
@@ -803,7 +887,6 @@ def test_several_processes_writing_to_one_journal_at_once_lose():
 
 
 def test_dead_letters():
-    global _, rep, tx
     # --- dead letters ---
     owed.update(down=True, undone=[])
     path8 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
@@ -842,7 +925,6 @@ def test_dead_letters():
 
 
 def test_crash_during_a_permanent_step():
-    global tx_id
     # crash during a permanent step; a person says "it didn't happen, undo the rest"
     path11 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
     crash_run("cancel", path11)
@@ -853,7 +935,6 @@ def test_crash_during_a_permanent_step():
 
 
 def test_compact():
-    global _, journal
     # --- compact ---
     for journal in (FileJournal(os.path.join(tempfile.mkdtemp(), "j.jsonl")),
                     SQLiteJournal(os.path.join(tempfile.mkdtemp(), "j.db"))):
@@ -885,7 +966,6 @@ def test_recover_never_touches_a_transaction_that_may_still_be():
 
 
 def test_in_another_process_that_is_alive_then_killed():
-    global child, worker
     # ...in another process that is alive, then killed
     path13 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
     child = (f"import sys, time; sys.path.insert(0, {here!r})\n"
@@ -919,7 +999,6 @@ def test_on_another_machine_can_t_be_checked_from_here_unless():
 
 
 def test_but_a_settled_transaction_that_owes_an_undo_is_retried():
-    global child, worker
     # ...but a settled transaction that owes an undo is retried even while its worker lives on
     path18 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
     child = (f"import sys, time; sys.path.insert(0, {here!r})\n"
@@ -945,7 +1024,6 @@ def test_but_a_settled_transaction_that_owes_an_undo_is_retried():
 
 
 def test_a_crashed_transaction_whose_last_open_items_are():
-    global rep
     # a crashed transaction whose last open items are acknowledged can be compacted
     path19 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
     crash_run("probe", path19)
@@ -960,7 +1038,6 @@ def test_a_crashed_transaction_whose_last_open_items_are():
 
 
 def test_a_standalone_call_whose_first_step_fails_leaves_nothing():
-    global lone
     # a standalone call whose first step fails leaves nothing marked live
     lone = Transaction(journal=os.path.join(tempfile.mkdtemp(), "j.jsonl"), log=quiet, confirm=APPROVE_ALL)
     expect(RuntimeError, lone.call, "book_flight", flight="XX9")
@@ -980,40 +1057,7 @@ def test_liveness_of_running_killed_and_zombie_processes():
 
 
 def test_maintenance_while_a_staged_transaction_runs_never():
-    global from_other_process, other, stage, stage_undone, tx
     # --- maintenance while a staged transaction runs never touches the running stage ---
-    class OtherProcess:
-        """The journal as another worker sees it: this process is a live process it can't look
-        inside (its pid is swapped for the parent's), and nothing is in that worker's _LIVE."""
-
-        def __init__(self, path):
-            self.j = FileJournal(path)
-
-        def append(self, records):
-            self.j.append(records)
-
-        def records(self):
-            return [{**r, "pid": os.getppid()} if "pid" in r else r for r in self.j.records()]
-
-        def drop(self, tx_ids):
-            self.j.drop(tx_ids)
-
-    @contextlib.contextmanager
-    def from_other_process(path):
-        hidden = set(_LIVE)
-        _LIVE.clear()
-        try:
-            yield OtherProcess(path)
-        finally:
-            _LIVE.update(hidden)
-
-    stage = {}
-    stage_undone = []
-    tool(lambda: "a", name="sa", undo=lambda r: stage_undone.append("a"), registry=stage)
-    tool(lambda: "b", name="sb", undo=lambda r: stage_undone.append("b"), registry=stage)
-    tool(lambda: 1 / 0, name="sbroken", undo=NOOP, registry=stage)
-    tool(lambda: "c", name="sc", undo=lambda r: 1 / 0, undo_retries=0, registry=stage)
-    tool(lambda: "p", name="sp", registry=stage)
 
     # compact() between stages, then a live stage 2
     path20 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
@@ -1030,7 +1074,6 @@ def test_maintenance_while_a_staged_transaction_runs_never():
 
 
 def test_acknowledging_stage_1_s_failed_undo_while_stage_2_runs():
-    global other, tx
     # acknowledging stage 1's failed undo while stage 2 runs
     path21 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
     tx = Transaction(registry=stage, journal=path21, log=quiet, confirm=APPROVE_ALL)
@@ -1045,7 +1088,6 @@ def test_acknowledging_stage_1_s_failed_undo_while_stage_2_runs():
 
 
 def test_a_stage_whose_rollback_owed_an_undo_acknowledged_and():
-    global other, tx
     # a stage whose rollback owed an undo, acknowledged and compacted by another worker,
     # followed by a new stage (found by the randomised tests, seed 3079722)
     path24 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
@@ -1063,7 +1105,6 @@ def test_a_stage_whose_rollback_owed_an_undo_acknowledged_and():
 
 
 def test_a_lone_failed_first_step_settles_itself_so_it_can_be():
-    global lone
     # a lone failed first step settles itself, so it can be compacted
     path22 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
     lone = Transaction(registry=stage, journal=path22, log=quiet, confirm=APPROVE_ALL)
@@ -1072,7 +1113,6 @@ def test_a_lone_failed_first_step_settles_itself_so_it_can_be():
 
 
 def test_but_not_while_a_permanent_step_is_pending():
-    global other, tx
     # ...but not while a permanent step is pending: the journal doesn't know about it yet
     path23 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
     tx = Transaction(registry=stage, journal=path23, log=quiet, confirm=APPROVE_ALL)
@@ -1088,7 +1128,6 @@ def test_but_not_while_a_permanent_step_is_pending():
 
 
 def test_nor_when_an_earlier_stage_s_owed_undo_is_acknowledged():
-    global other, tx
     # ...nor when an earlier stage's owed undo is acknowledged and compacted: the records left
     # must still say who runs the transaction
     path25 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
@@ -1108,7 +1147,6 @@ def test_nor_when_an_earlier_stage_s_owed_undo_is_acknowledged():
 
 
 def test_a_crash_inside_a_permanent_step_does_not_hold_back_an():
-    global first
     # a crash inside a permanent step does not hold back an earlier stage's owed undo, and
     # acknowledging the whole transaction afterwards does not wipe it
     path26 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
@@ -1153,7 +1191,6 @@ def test_a_failed_permanent_step_after_an_earlier_commit_leaves():
 
 
 def test_recover_retrying_an_owed_undo_while_the_worker_starts():
-    global release, tx, worker
     # recover() retrying an owed undo while the worker starts its next stage: the new stage must
     # not be closed by a record recover() writes afterwards
     in_undo, release = threading.Event(), threading.Event()
@@ -1185,7 +1222,6 @@ def test_recover_retrying_an_owed_undo_while_the_worker_starts():
 
 
 def test_an_undo_journaled_for_a_step_whose_done_was_never():
-    global outcome
     # an undo journaled for a step whose "done" was never written closes that step too
     for outcome in ("undone", "undo_failed"):
         torn = _replay([{"tx": "T", "event": "started", "step": "s", "tool": "sa", "permanent": False},
@@ -1194,7 +1230,6 @@ def test_an_undo_journaled_for_a_step_whose_done_was_never():
 
 
 def test_a_read_only_step_whose_result_can_t_be_stored_needs():
-    global rep, tx
     # a read-only step whose result can't be stored needs nothing undone after a crash
     dated = {}
     tool(lambda: datetime.date(2026, 1, 1), name="today", undo=NOOP, registry=dated)
@@ -1235,7 +1270,6 @@ def test_list_indexes():
 
 
 def test_settle_records():
-    global events, path14, tx
     # --- settle records: one per settle, none for an empty transaction ---
     path14 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
     with Transaction(registry=odd, journal=path14, log=quiet, confirm=APPROVE_ALL) as tx:
@@ -1250,12 +1284,14 @@ def test_settle_records():
 
 def test_acknowledge_rejects_ids_the_journal_doesn_t_have():
     # --- acknowledge() rejects ids the journal doesn't have ---
+    path14 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
+    with Transaction(registry=odd, journal=path14, log=quiet, confirm=APPROVE_ALL) as tx:
+        tx.call("part_a")
     expect(ValueError, acknowledge, path14, "no-such-tx")
     expect(ValueError, acknowledge, path14, FileJournal(path14).records()[0]["tx"], "no-such-step")
 
 
 def test_compact_removes_a_transaction_once_its_last_dead_letter():
-    global tx
     # --- compact() removes a transaction once its last dead letter is acknowledged ---
     path15 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
     owed.update(down=True)
@@ -1268,7 +1304,6 @@ def test_compact_removes_a_transaction_once_its_last_dead_letter():
 
 
 def test_an_uncertain_step_is_reported_once_even_while_another():
-    global first, second, warned
     # --- an uncertain step is reported once, even while another undo keeps failing ---
     down_registry = {}
     tool(lambda flight: None, name="hold", undo=lambda r: 1 / 0, undo_retries=0, registry=down_registry)
@@ -1328,12 +1363,7 @@ def test_tool_descriptions_for_models():
 
 
 def test_findings_from_the_0_8_6_audits():
-    global reg6, tx, world6
     # ---------------------------------------------------------------- independent audits, 0.8.6
-    world6 = set()
-    reg6 = {}
-    tool(lambda k: world6.add(k) or k, name="put", undo=lambda r: world6.discard(r), registry=reg6)
-    tool(lambda: "p", name="perm", registry=reg6)
 
     # compact() never removes records written after it read the journal (a new stage)
     for kind in (FileJournal, SQLiteJournal):
@@ -1360,7 +1390,6 @@ def test_findings_from_the_0_8_6_audits():
 
 
 def test_a_line_torn_by_a_power_cut_is_ended_so_the_next_record():
-    global f
     # a line torn by a power cut is ended, so the next record is not lost with it
     path31 = os.path.join(tempfile.mkdtemp(), "rubicon.jsonl")
     FileJournal(path31).append([{"tx": "T", "event": "begin"}])
@@ -1371,7 +1400,6 @@ def test_a_line_torn_by_a_power_cut_is_ended_so_the_next_record():
 
 
 def test_a_transaction_running_in_this_process_is_never_touched():
-    global tx
     # a transaction running in this process is never touched by a recover() here, including
     # the moments its first and last records are being written
     class Watching(SQLiteJournal):
@@ -1398,7 +1426,6 @@ def test_a_transaction_running_in_this_process_is_never_touched():
 
 
 def test_acknowledging_a_whole_transaction_never_settles_a_stage():
-    global tx
     # acknowledging a whole transaction never settles a stage it started afterwards
     flaky_undo_down = {"down": True}
 
@@ -1423,7 +1450,6 @@ def test_acknowledging_a_whole_transaction_never_settles_a_stage():
 
 
 def test_a_journal_that_fails_mid_rollback_never_hides_the_real():
-    global e
     # a journal that fails mid-rollback never hides the real error or a step's true outcome
     class Failing(FileJournal):
         fail = set()
@@ -1509,7 +1535,6 @@ def test_a_step_is_marked_running_before_started_is_written_so_no():
 
 
 def test_a_step_that_finishes_on_another_thread_after_a_rollback():
-    global outcome, tx, worker
     # a step that finishes on another thread after a rollback undoes itself
     gate = threading.Event()
 
@@ -1531,7 +1556,6 @@ def test_a_step_that_finishes_on_another_thread_after_a_rollback():
 
 
 def test_a_process_that_exited_with_code_259_still_active_s_value():
-    global child
     # a process that exited with code 259 (STILL_ACTIVE's value on Windows) is not alive
     child = subprocess.Popen([sys.executable, "-c", "import os; os._exit(259)"])
     child.wait()
@@ -1553,7 +1577,6 @@ def test_plan_inputs_are_validated():
 
 
 def test_a_path_into_an_object_that_isn_t_a_dict_or_list_is_a_bad():
-    global e
     # a path into an object that isn't a dict or list is a bad reference, not dumped text
     @dataclass
     class Seat:
@@ -1567,7 +1590,6 @@ def test_a_path_into_an_object_that_isn_t_a_dict_or_list_is_a_bad():
 
 
 def test_an_undo_with_an_option_of_its_own_gets_just_the_result():
-    global got, t
     # an undo with an option of its own gets just the result
     got = []
     tool(lambda k: k, name="opt", undo=lambda r, force=False: got.append((r, force)), registry=reg6)

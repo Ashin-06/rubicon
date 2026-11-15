@@ -725,7 +725,7 @@ To report a vulnerability, see [SECURITY.md](https://github.com/Ashin-06/rubicon
 
 ## Testing
 
-The suite has 173 pytest tests with 94% line coverage, grouped by feature under
+The suite has 172 pytest tests with 94% line coverage, grouped by feature under
 `tests/`. No API keys or network are needed.
 
 ```bash
@@ -743,8 +743,8 @@ pytest tests/test_confirm.py   # one area: the fail-closed confirmation gate
 | `tests/test_llm.py` | planners and `agent()` with stub clients |
 | `tests/test_fuzz.py` | randomised invariants, below |
 
-The tests in `tests/test_core.py` and `test_mcp.py` share module state and run in file order, as
-pytest does by default. The Gemini planner tests skip when the `gemini` extra is not installed.
+Every test starts from a fresh world, so the suite passes in any order; CI also runs it shuffled
+with `pytest-randomly`. The Gemini planner tests skip when the `gemini` extra is not installed.
 
 `tests/test_fuzz.py` adds randomised invariant tests. They generate random plans and agent loops
 with tool failures, failing checks, declined confirmations, undo outages, parallel runs and
