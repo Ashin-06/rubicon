@@ -742,8 +742,8 @@ pytest tests/test_confirm.py   # one area: the fail-closed confirmation gate
 | `tests/test_llm.py` | planners and `agent()` with stub clients |
 | `tests/test_fuzz.py` | randomised invariants, below |
 
-The tests in `tests/test_core.py`, `test_mcp.py` and `test_llm.py` share module state and run in
-file order, as pytest does by default.
+The tests in `tests/test_core.py` and `test_mcp.py` share module state and run in file order, as
+pytest does by default. The Gemini planner tests skip when the `gemini` extra is not installed.
 
 `tests/test_fuzz.py` adds randomised invariant tests. They generate random plans and agent loops
 with tool failures, failing checks, declined confirmations, undo outages, parallel runs and

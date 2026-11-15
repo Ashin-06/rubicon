@@ -1,6 +1,7 @@
 """Planners and agent(): plan parsing, repair, retries and confirmation, with stub clients."""
 import asyncio
 import builtins
+import importlib.util
 import json
 import logging
 import math
@@ -82,6 +83,35 @@ class OpenAI:
         self.kw = kw
         return NS(choices=[NS(finish_reason=self.finish, message=NS(content=self.text, refusal=None))])
 
+rep = {}  # typed tools for the repair tests
+
+
+@tool(undo=NOOP, registry=rep)
+def book(flight_number: str, seats: int, refundable: bool = False, price: float = 0.0):
+    """Typed tool for repair tests."""
+    return flight_number
+
+
+@tool(undo=NOOP, registry=rep)
+def count_seats() -> dict:
+    return {"n": 2}
+
+
+async def async_planner(goal, client, registry):
+    return parse_plan(text, registry)
+
+
+needs_genai = pytest.mark.skipif(importlib.util.find_spec("google") is None
+                                 or importlib.util.find_spec("google.genai") is None,
+                                 reason="google-genai not installed (the gemini extra)")
+
+
+@pytest.fixture(autouse=True)
+def _fresh_state():
+    """Each test starts with nothing held or cancelled and asserts only on its own effects."""
+    state.update(held=0, cancelled=[])
+
+
 quiet = lambda m: None
 
 def expect(exc, fn, *a, **k):
@@ -92,8 +122,8 @@ def expect(exc, fn, *a, **k):
     raise AssertionError(f"expected {exc.__name__}")
 
 
+@needs_genai
 def test_gemini_default_planner():
-    global g
     # Gemini (default planner): reordered; only the permanent step needs confirmation.
     g, seen = Gemini(text), []
     agent("move", client=g, registry=reg, confirm=lambda st: seen.extend(s["id"] for s in st) or True, log=quiet)
@@ -107,8 +137,8 @@ def test_gemini_default_planner():
     assert "SAFETY" in str(expect(RuntimeError, plan_with_gemini, "x", Gemini(""), reg))
 
 
+@needs_genai
 def test_model_env_vars_set_after_import_e_g_by_load_dotenv_still():
-    global c, g
     # model env vars set after import (e.g. by load_dotenv) still apply; model= wins over both
     os.environ["GEMINI_MODEL"], os.environ["CLAUDE_MODEL"] = "late-gemini", "late-claude"
     try:
@@ -125,7 +155,6 @@ def test_model_env_vars_set_after_import_e_g_by_load_dotenv_still():
 
 
 def test_claude():
-    global c
     # Claude.
     c = Claude(text)
     agent("move", planner=plan_with_claude, client=c, registry=reg, confirm=lambda st: True, log=quiet)
@@ -148,7 +177,7 @@ def test_openai_compatible():
     expect(RuntimeError, plan_with_openai, "x", OpenAI(text, finish="length"), reg, model="m")
     expect(RuntimeError, plan_with_openai, "x", OpenAI("", finish="stop"), reg, model="m")
     assert plan_with_openai("x", OpenAI(text, finish="eos"), reg, model="m")  # other normal finishes
-    assert state == {"held": 3, "cancelled": ["OLD1"] * 3}
+    assert state == {"held": 1, "cancelled": ["OLD1"]}  # only the agent() run acts
 
 
 def test_bring_your_own_model():
@@ -159,10 +188,11 @@ def test_bring_your_own_model():
     assert parse_plan('{"steps": [{"id": "s", "tool": "search", "args_json": {"route": "y"}}]}', reg)[0]["args"] == {"route": "y"}
 
 
+@needs_genai
 def test_human_declines():
     # Human declines -> held seat released, nothing cancelled.
     expect(PlanFailed, agent, "move", client=Gemini(text), registry=reg, confirm=lambda st: False, log=quiet)
-    assert state == {"held": 3, "cancelled": ["OLD1"] * 3}
+    assert state == {"held": 0, "cancelled": []}
 
 
 def test_untrusted_output_is_rejected_before_anything_runs():
@@ -204,19 +234,7 @@ def test_lenient_parsing():
 
 
 def test_local_repair():
-    global calls, fixes, rep
     # Local repair: small, unambiguous mistakes are fixed without asking the model again.
-    rep = {}
-
-    @tool(undo=NOOP, registry=rep)
-    def book(flight_number: str, seats: int, refundable: bool = False, price: float = 0.0):
-        """Typed tool for repair tests."""
-        return flight_number
-
-    @tool(undo=NOOP, registry=rep)
-    def count_seats() -> dict:
-        return {"n": 2}
-
     fixes = []
     fixed = parse_plan(json.dumps([{"id": "b", "tool": "Book", "args": {
         "flightNumber": 101, "Seats": "2", "refundable": "TRUE", "price": "9.5"}}]), rep, repairs=fixes)
@@ -259,7 +277,6 @@ def test_bracketed_prose_before_the_plan_doesn_t_hijack_parsing():
 
 
 def test_two_keys_aiming_at_one_parameter_are_ambiguous():
-    global fixes
     # Two keys aiming at one parameter are ambiguous: neither is renamed.
     @tool(undo=NOOP, registry=rep)
     def flex(flight_number: str = "", **extra):
@@ -271,7 +288,6 @@ def test_two_keys_aiming_at_one_parameter_are_ambiguous():
 
 
 def test_nan_never_produces_a_bogus_repair_and_isn_t_turned_into():
-    global fixes
     # NaN never produces a bogus repair, and isn't turned into the string "nan".
     fixes = []
     nan_plan = parse_plan('[{"id": "b", "tool": "book", "args": {"flight_number": NaN, "seats": 1, "price": NaN}}]',
@@ -334,20 +350,17 @@ def test_a_rejected_plan_is_sent_back_to_the_model_once_with_the():
     for bad_attempts in (0, -1, 1.5, True):
         expect(ValueError, agent, "x", planner=picky, registry=reg, attempts=bad_attempts, log=quiet)
     expect(ValueError, lambda: asyncio.run(aagent("x", planner=picky, registry=reg, attempts=0, log=quiet)))
-    assert state["cancelled"] == ["OLD1"] * 4
+    assert state["cancelled"] == ["OLD1"]  # only the corrected plan ran
 
 
+@needs_genai
 def test_async_agent():
-    global async_planner
     # Async agent: sync confirm runs off the event loop thread; async planners are awaited.
     threads = []
 
     def confirm_in_thread(steps):
         threads.append(threading.current_thread() is threading.main_thread())
         return True
-
-    async def async_planner(goal, client, registry):
-        return parse_plan(text, registry)
 
     async def run_async():
         await aagent("move", client=Gemini(text), registry=reg, confirm=confirm_in_thread, log=quiet)
@@ -359,9 +372,10 @@ def test_async_agent():
         assert ask_human([{"id": "c", "tool": "cancel_booking", "args": {}, "preview": "p"}]) is False
     finally:
         builtins.input = real_input
-    assert state == {"held": 5, "cancelled": ["OLD1"] * 6}
+    assert state == {"held": 2, "cancelled": ["OLD1"] * 2}
 
 
+@needs_genai
 def test_an_async_confirm_reached_through_a_lambda_or_an_object():
     # An async confirm reached through a lambda or an object is awaited: a "no" stays a no.
     async def says_no(steps):
@@ -378,11 +392,10 @@ def test_an_async_confirm_reached_through_a_lambda_or_an_object():
     plan = asyncio.run(aagent("move", planner=lambda g, c, r: async_planner(g, c, r), registry=reg,
                               confirm=lambda st: True, log=quiet))
     assert plan["c"] is None
-    assert state["cancelled"] == ["OLD1"] * 7
+    assert state == {"held": 1, "cancelled": ["OLD1"]}  # the two refusals released their holds
 
 
 def test_only_a_rejected_plan_goes_back_to_the_model():
-    global calls
     # Only a rejected plan goes back to the model: a configuration error is raised at once.
     calls = []
 
