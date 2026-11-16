@@ -64,7 +64,8 @@ class Guard:
         return {}
 
     async def acommit_node(self, state):
-        """commit_node for graphs run with ainvoke/astream."""
+        """commit_node for graphs run with ainvoke/astream (Python 3.11+, where LangGraph's
+        interrupt() works in async nodes)."""
         self._ask()
         try:
             self.results = await self.tx.acommit()

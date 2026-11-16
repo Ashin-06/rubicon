@@ -1,5 +1,6 @@
 """rubicon_langgraph: guarded tools in a LangGraph agent, the gate as an interrupt, commit at the end."""
 import runpy
+import sys
 from pathlib import Path
 
 import pytest
@@ -79,6 +80,7 @@ def test_the_runnable_example(example):
     assert "'bookings': set()" in lines[-1]
 
 
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="LangGraph's interrupt() in async nodes needs Python 3.11+")
 def test_async_graph(example):
     import asyncio
 

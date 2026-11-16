@@ -405,7 +405,7 @@ from rubicon_langgraph import Guard
 
 guard = Guard(registry)
 builder.add_node("tools", ToolNode(guard.tools(), handle_tool_errors=True))
-builder.add_node("commit", guard.commit_node)          # acommit_node for ainvoke
+builder.add_node("commit", guard.commit_node)          # acommit_node for ainvoke (3.11+)
 graph = builder.compile(checkpointer=MemorySaver())    # interrupts need a checkpointer
 
 with guard:                                            # an error in the graph rolls back
