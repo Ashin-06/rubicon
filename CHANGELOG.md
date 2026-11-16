@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.9.0 - 2026-11-15
+
+### Breaking
+- The confirmation gate fails closed. `run()`, `arun()`, `agent()`, `aagent()` and
+  `Transaction` given no `confirm=` used to approve permanent steps silently; they now refuse
+  them. The plan fails with `PlanFailed` at step `"confirm"` after everything undoable is rolled
+  back. Plans with only undoable steps still run without a confirm.
+- Only a confirm that returns exactly `True` approves. Any other value (`1`, `"yes"`, a non-empty
+  list, an object), an exception raised by the confirm, or a failed `await` declines, and the
+  gate emits `gate_declined`.
+- To keep the old behaviour for unattended runs, pass `confirm=APPROVE_ALL` (new export).
+- The self-checks moved out of each module's `__main__` into pytest tests under `tests/`;
+  `python rubicon.py` no longer runs anything. Run `pytest` instead.
+
+### Added
+- `APPROVE_ALL`, the explicit opt-in for running permanent steps with nobody asked.
+- `tests/test_confirm.py`: missing, raising, truthy-but-not-`True` and async-failing confirms
+  never run a permanent step, across `run`, `arun`, `Transaction` (sync and async) and `agent`.
+- `demo.py --yes` approves unattended with `APPROVE_ALL`.
+
+### Fixed
+- Sync calls (`run()`, `tx.call()`, `tx.commit()` outside an event loop) reuse one event loop per
+  thread instead of starting a new one each time. On Windows, thousands of new loops in a row
+  could leave one stuck opening its loopback socket pair, and each call is now cheaper. Anything a
+  call starts is still cancelled before it returns. Python 3.10 keeps a new loop per call.
+
+### Changed
+- Tests are grouped by area (`test_core.py`, `test_confirm.py`, `test_mcp.py`, `test_llm.py`,
+  `test_fuzz.py`); the README lists the test count and coverage.
+- A test that hangs fails after two minutes (`pytest-timeout`, in the `dev` extra), and a CI
+  job after twenty.
+- CI pins every action by commit SHA, runs the core tests with only pytest installed, and runs the
+  suite against the installed wheel.
+
 ## 0.8.6 - 2026-11-10
 
 Three independent audits (core concurrency and crashes; untrusted model output, signatures and

@@ -168,7 +168,7 @@ plan = [  # the order a careless model might write
 def ask(steps):
     for s in steps:
         print(f"about to run {s['tool']}{s['args']}: {s['preview']}")
-    return input("Commit? [y/N] ") == "y"
+    return input("Commit? [y/N] ") == "y"   # only True approves
 
 try:
     print(run(plan, confirm=ask))      # runs find, hold, then checks cancel, asks, cancels
@@ -180,9 +180,11 @@ print(seats, bookings)
 Answer `n` and the held seat is released: `{'AI101': 1} {'OLD1'}`. Set `seats = {"AI101": 0}` and
 `hold_seat` fails, so the booking is never touched.
 
-> **`run()` without `confirm=` approves permanent steps automatically.** Pass a `confirm`
-> whenever a person should decide. (`agent()`, the model-driven version, asks on the terminal by
-> default.)
+> **Permanent steps never run without a yes.** With no `confirm=`, `run()`, `arun()` and
+> `Transaction` refuse them: the plan fails at step `"confirm"` and everything undoable is rolled
+> back. Only a confirm that returns exactly `True` approves; any other value, an exception or a
+> failed `await` declines. For unattended runs, opt in with `confirm=APPROVE_ALL`. Plans with
+> only undoable steps need no confirm. (`agent()` asks on the terminal by default.)
 
 ## Words used here
 
@@ -614,6 +616,7 @@ cp .env.example .env           # then put your key in .env (Windows: copy .env.e
 python demo.py                 # Gemini
 python demo.py claude          # Claude
 python demo.py openai          # OpenAI-compatible: set OPENAI_MODEL (and OPENAI_BASE_URL) in .env
+python demo.py claude --yes    # approve the permanent steps unattended (APPROVE_ALL)
 ```
 
 ## API reference
@@ -625,7 +628,8 @@ python demo.py openai          # OpenAI-compatible: set OPENAI_MODEL (and OPENAI
 | `tool(fn=None, *, undo=None, check=None, name=None, registry=None, retries=0, undo_retries=2, timeout=None)` | Register a tool. See [Tools](#tools-undo-checks-previews-retries). |
 | `NOOP` | Undo function for read-only tools. |
 | `UNSET` | Default for optional parameters that should be left out of the call entirely. |
-| `run(plan, registry=None, confirm=None, log=None, *, parallel=False, on_event=None, journal=None)`, `arun(...)` | Run a plan and return `{step_id: result}`. |
+| `run(plan, registry=None, confirm=None, log=None, *, parallel=False, on_event=None, journal=None)`, `arun(...)` | Run a plan and return `{step_id: result}`. Without `confirm`, permanent steps are refused. |
+| `APPROVE_ALL` | `confirm=APPROVE_ALL` approves permanent steps with nobody asked, for unattended runs. |
 | `order(plan, registry=None)` | Validate a plan and return the order it would run in. Raises `ValueError`. |
 | `Transaction(registry=None, confirm=None, log=None, *, on_event=None, journal=None)` | Guard an agent loop. Methods: `call`/`acall`, `commit`/`acommit`, `rollback`/`arollback`, `wrap(name)`, `wrap_all()` (a list). Attributes: `id`, `results`, `committed`, `undone`, `undo_failed`. A sync or async context manager. |
 | `PlanFailed` | Raised after rollback. Attributes: `step`, `cause`, `undone`, `committed`, `not_run`, `undo_failed`, `results`. |
@@ -713,6 +717,7 @@ To report a vulnerability, see [SECURITY.md](https://github.com/Ashin-06/rubicon
 | `ValueError: step 'x': unknown tool 'y'` | The tool isn't in the registry used. Did you register it with `registry=` but call `run()` without it, or the other way round? |
 | `ValueError: ... arguments [...] don't fit ...` | The plan's `args` don't match the tool's parameters. The message names the mismatch. |
 | `RuntimeError: ... inside a running event loop ...` | You called `run()` (or an async tool from sync code) inside an event loop, for example in Jupyter or an async web server. Use `await arun(...)` or `async with Transaction()`. |
+| `PlanFailed` at step `"confirm"` with no confirm passed | Permanent steps need a `confirm=` that returns `True`. Pass `confirm=APPROVE_ALL` to run them unattended. |
 | `agent()` always declines | `ask_human` answers no when there is no terminal (CI, some IDE runners). Pass `confirm=`. |
 | `JournalBusy` | Another `recover()` or `compact()` holds the journal's lock, or a writer waited more than 30 seconds. Retry later. |
 | An undo ran twice | The process died after the undo but before it was journaled, and `recover()` ran it again. Make undos idempotent. |
@@ -720,16 +725,26 @@ To report a vulnerability, see [SECURITY.md](https://github.com/Ashin-06/rubicon
 
 ## Testing
 
-Each module has a self-check next to its code, and pytest runs all of them. No API keys or
-network are needed.
+The suite has 173 pytest tests with 94% line coverage, grouped by feature under
+`tests/`. No API keys or network are needed.
 
 ```bash
 pip install -e ".[all,dev]"
-python rubicon.py              # core
-python rubicon_mcp.py          # MCP adapter against an in-memory MCP server
-python rubicon_llm.py          # planners with stub clients
 pytest --cov                   # everything, with coverage
+pytest tests/test_confirm.py   # one area: the fail-closed confirmation gate
 ```
+
+| File | Covers |
+|---|---|
+| `tests/test_core.py` | ordering, checks, the gate, rollback, `Transaction`, journals, recovery, dead letters, compaction |
+| `tests/test_confirm.py` | missing, raising, truthy-but-not-`True` and async-failing confirms never run a permanent step |
+| `tests/test_sync_loop.py` | sync calls reuse one event loop per thread, stay fast and still unwind on Ctrl+C |
+| `tests/test_mcp.py` | MCP adapter against an in-memory MCP server |
+| `tests/test_llm.py` | planners and `agent()` with stub clients |
+| `tests/test_fuzz.py` | randomised invariants, below |
+
+The tests in `tests/test_core.py` and `test_mcp.py` share module state and run in file order, as
+pytest does by default. The Gemini planner tests skip when the `gemini` extra is not installed.
 
 `tests/test_fuzz.py` adds randomised invariant tests. They generate random plans and agent loops
 with tool failures, failing checks, declined confirmations, undo outages, parallel runs and
@@ -756,16 +771,16 @@ RUBICON_FUZZ_SEED=1234 pytest tests/test_fuzz.py   # replay a reported failure
 
 (On Windows PowerShell, set variables first: `$env:RUBICON_FUZZ=20000; pytest tests/test_fuzz.py`.)
 
-CI runs the core with nothing installed, then the full suite on Python 3.10 to 3.14 on Linux,
+CI runs the core tests with only pytest installed, then the full suite on Python 3.10 to 3.14 on Linux,
 Python 3.12 on Windows and macOS, and MCP SDK 1.x and 2.x. It also builds the package and runs
-the self-checks from the installed wheel.
+the suite against the installed wheel.
 
 ```
 rubicon.py        core: registry, ordering, validation, gate, rollback, Transaction, journals
 rubicon_mcp.py    MCP adapter
 rubicon_llm.py    Gemini, Claude and OpenAI-compatible planners, plus bring-your-own-model helpers
 demo.py           live demo with fake travel tools
-tests/            pytest entry point for the self-checks, and the randomised invariant tests
+tests/            pytest suite, including the randomised invariant tests
 ```
 
 ## Contributing

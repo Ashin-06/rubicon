@@ -26,9 +26,8 @@ pip install -e ".[all,dev]"
 pytest                            # everything, no API keys or network needed
 ```
 
-Each module carries its own self-check next to the code (`python rubicon.py`,
-`python rubicon_mcp.py`, `python rubicon_llm.py`), and `tests/test_fuzz.py` holds the
-randomised invariant tests. A deeper fuzz run before a pull request that touches execution or
+Tests live under `tests/`, one file per area (`test_core.py`, `test_confirm.py`, `test_mcp.py`,
+`test_llm.py`), and `tests/test_fuzz.py` holds the randomised invariant tests. A deeper fuzz run before a pull request that touches execution or
 recovery is appreciated:
 
 ```bash

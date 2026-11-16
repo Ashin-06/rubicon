@@ -21,7 +21,7 @@ if env.exists():
             if v:  # a blank "KEY=" line from .env.example must not hide a key set elsewhere
                 os.environ.setdefault(k.strip(), v)
 
-from rubicon import NOOP, PlanFailed, run, tool
+from rubicon import APPROVE_ALL, NOOP, PlanFailed, run, tool
 from rubicon_llm import ask_human, plan_with_claude, plan_with_gemini, plan_with_openai
 
 db = {"bookings": {"OLD1"}, "seats": {"AI101": 2, "AI202": 0}, "holds": [], "outbox": []}
@@ -81,7 +81,8 @@ def openai_planner(goal, client, registry):
     return plan_with_openai(goal, client, registry, model=model, base_url=os.environ.get("OPENAI_BASE_URL"))
 
 
-provider = sys.argv[1] if len(sys.argv) > 1 else "gemini"
+args = [a for a in sys.argv[1:] if a != "--yes"]
+provider = args[0] if args else "gemini"
 planners = {"gemini": plan_with_gemini, "claude": plan_with_claude, "openai": openai_planner}
 if provider not in planners:
     sys.exit(f"unknown provider {provider!r}; choose one of {sorted(planners)}")
@@ -93,7 +94,9 @@ except Exception as e:  # quota, network, refusal, a plan that stayed invalid...
     sys.exit(f"the {provider} planner failed: {type(e).__name__}: {str(e)[:300]}")
 print("Plan:\n" + json.dumps(plan, indent=1))
 try:
-    results = run(plan, registry=reg, confirm=ask_human, log=print)
+    # ask_human asks on the terminal; pass --yes to approve unattended (confirm=APPROVE_ALL)
+    confirm = APPROVE_ALL if "--yes" in sys.argv else ask_human
+    results = run(plan, registry=reg, confirm=confirm, log=print)
     print("results:", results)
 except PlanFailed as e:
     print("rolled back:", e)
