@@ -35,7 +35,8 @@ claude = ["anthropic>=0.86"]
 openai = ["openai>=1.40"]
 postgres = ["psycopg[binary]>=3.1"]
 otel = ["opentelemetry-api>=1.20"]
-all = ["rubicon-agents[mcp,gemini,claude,openai,postgres,otel]"]
+langgraph = ["langgraph>=0.4"]
+all = ["rubicon-agents[mcp,gemini,claude,openai,postgres,otel,langgraph]"]
 dev = ["pytest>=8", "pytest-cov>=5", "pytest-timeout>=2.3", "opentelemetry-sdk>=1.20"]
 
 [project.urls]
@@ -46,7 +47,7 @@ Issues = "https://github.com/Ashin-06/rubicon/issues"
 Changelog = "https://github.com/Ashin-06/rubicon/blob/main/CHANGELOG.md"
 
 [tool.setuptools]
-py-modules = ["rubicon", "rubicon_mcp", "rubicon_llm", "rubicon_otel"]
+py-modules = ["rubicon", "rubicon_mcp", "rubicon_llm", "rubicon_otel", "rubicon_langgraph"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -55,4 +56,4 @@ timeout = 120  # a hung test fails with every thread's stack instead of stalling
 
 [tool.coverage.run]
 source = ["."]
-omit = ["tests/*", "demo.py"]
+omit = ["tests/*", "demo.py", "examples/*"]

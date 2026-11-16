@@ -13,6 +13,9 @@
   New `otel` extra (`opentelemetry-api`).
 - Two events: `tx_failed` (the failing step, the error, and what did not run) and `tx_settled`
   (once per commit or rollback, with its status and any undo still owed).
+- `rubicon_langgraph.Guard`: Transaction-guarded tools for a LangGraph agent, a commit node that
+  asks for confirmation as a human-in-the-loop interrupt, and rollback on errors. New
+  `langgraph` extra and a runnable example, `examples/langgraph_agent.py`.
 
 ### Fixed
 - Since 0.9.0, sync calls on Python 3.11+ ran with the context vars of the thread's first sync
