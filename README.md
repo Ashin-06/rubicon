@@ -117,8 +117,9 @@ The package is called `rubicon-agents`; you import it as `rubicon` (plus `rubico
 | `openai` | `openai` | `plan_with_openai` (OpenAI and compatible servers) |
 | `mcp` | `mcp` | `register_mcp` |
 | `postgres` | `psycopg` 3 | `PostgresJournal` |
+| `otel` | `opentelemetry-api` | `rubicon_otel.tracing()` |
 | `all` | all of the above | |
-| `dev` | `pytest`, `pytest-cov`, `pytest-timeout` | running the tests |
+| `dev` | `pytest`, `pytest-cov`, `pytest-timeout`, `opentelemetry-sdk` | running the tests |
 
 For example `pip install -e ".[gemini,mcp]"`.
 
