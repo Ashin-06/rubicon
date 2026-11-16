@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Packaging
+- A release workflow (`publish.yml`) uploads each published GitHub release to PyPI through
+  trusted publishing, after checking that the tag matches the version and testing the built
+  wheel. `RELEASING.md` describes the one-time PyPI setup.
+
 ## 0.10.0 - 2026-11-16
 
 ### Added

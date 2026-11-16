@@ -94,7 +94,11 @@ It is not the right tool when:
 
 ## Install
 
-Rubicon is not on PyPI yet. Install it from GitHub:
+```bash
+pip install rubicon-agents
+```
+
+Until the first PyPI release is out, install it from GitHub:
 
 ```bash
 pip install "rubicon-agents @ git+https://github.com/Ashin-06/rubicon.git"
@@ -847,7 +851,8 @@ tests/            pytest suite, including the randomised invariant tests
 
 Issues and pull requests are welcome; see
 [CONTRIBUTING.md](https://github.com/Ashin-06/rubicon/blob/main/CONTRIBUTING.md). Bugs with a
-small script that reproduces them get fixed fastest.
+small script that reproduces them get fixed fastest. Maintainers release as described in
+[RELEASING.md](https://github.com/Ashin-06/rubicon/blob/main/RELEASING.md).
 
 ## License
 
