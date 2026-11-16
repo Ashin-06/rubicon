@@ -124,10 +124,14 @@ class World:
 
 
 class CrashJournal:
-    """An in-memory journal whose process dies after a chosen number of writes."""
+    """A journal whose process dies after a chosen number of writes. Rows live in memory, or in
+    a real journal when `backing` is set to a factory for one (see tests/test_postgres.py)."""
+
+    backing = None
 
     def __init__(self, world, writes_until_crash, die_in_permanent=0.0):
         self.world, self.rows, self.left = world, [], writes_until_crash
+        self.store = self.backing() if self.backing else None
         self.die_in_permanent = die_in_permanent  # chance to die right after a permanent step starts
         self.rng = random.Random(writes_until_crash)
 
@@ -138,22 +142,28 @@ class CrashJournal:
             self.world.dead = True
             raise Died()
         self.left -= 1
-        self.rows.extend(dict(r) for r in records)
+        if self.store:
+            self.store.append(records)
+        else:
+            self.rows.extend(dict(r) for r in records)
         if (any(r.get("event") == "started" and r.get("permanent") for r in records)
                 and self.rng.random() < self.die_in_permanent):
             self.left = 0  # the next write (the step's outcome) never happens
 
     def records(self):
-        return list(self.rows)
+        return self.store.records() if self.store else list(self.rows)
 
     def drop(self, tx_ids):
-        self.rows = [r for r in self.rows if r.get("tx") not in set(tx_ids)]
+        if self.store:
+            self.store.drop(tx_ids)
+        else:
+            self.rows = [r for r in self.rows if r.get("tx") not in set(tx_ids)]
 
     def restart(self, writes_until_crash=-1):
         """A new process starts: the world is reachable again, nothing in memory is live."""
         self.world.dead = False
         self.left = writes_until_crash
-        for row in self.rows:
+        for row in self.records():
             _LIVE.discard(row.get("tx"))
 
 
@@ -545,9 +555,9 @@ def scenario_mid_recovery(rng):
     return final_state_problems(world, journal, reg)
 
 
-def _sweep(scenario, offset):
+def _sweep(scenario, offset, count=COUNT):
     failures = []
-    for n in range(COUNT):
+    for n in range(count):
         seed = SEED + offset + n
         problems = scenario(random.Random(seed))
         if problems:

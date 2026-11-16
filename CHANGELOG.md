@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- `PostgresJournal(conninfo, table="rubicon_journal")`, for workers on several machines, with
+  the new `postgres` extra (psycopg 3). Same contract as `SQLiteJournal`: ordered `append` and
+  `records`, `lock()` through a PostgreSQL advisory lock, and `drop(tx_ids, upto)` for
+  `compact()`. Tested in CI against PostgreSQL 17, including the crash and maintenance fuzz
+  scenarios.
+
 ## 0.9.0 - 2026-11-15
 
 ### Breaking
