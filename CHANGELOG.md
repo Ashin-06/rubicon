@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- `rubicon_otel.tracing()`, an `on_event` callback that records OpenTelemetry spans: one per
+  transaction (or stage), with child spans for steps, checks, the gate, undos and the failure.
+  New `otel` extra (`opentelemetry-api`).
+- Two events: `tx_failed` (the failing step, the error, and what did not run) and `tx_settled`
+  (once per commit or rollback, with its status and any undo still owed).
+
 ## 0.9.0 - 2026-11-15
 
 ### Breaking

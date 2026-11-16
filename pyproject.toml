@@ -33,8 +33,9 @@ mcp = ["mcp>=1.26"]
 gemini = ["google-genai>=1.66"]
 claude = ["anthropic>=0.86"]
 openai = ["openai>=1.40"]
-all = ["rubicon-agents[mcp,gemini,claude,openai]"]
-dev = ["pytest>=8", "pytest-cov>=5", "pytest-timeout>=2.3"]
+otel = ["opentelemetry-api>=1.20"]
+all = ["rubicon-agents[mcp,gemini,claude,openai,otel]"]
+dev = ["pytest>=8", "pytest-cov>=5", "pytest-timeout>=2.3", "opentelemetry-sdk>=1.20"]
 
 [project.urls]
 Homepage = "https://github.com/Ashin-06/rubicon"
@@ -44,7 +45,7 @@ Issues = "https://github.com/Ashin-06/rubicon/issues"
 Changelog = "https://github.com/Ashin-06/rubicon/blob/main/CHANGELOG.md"
 
 [tool.setuptools]
-py-modules = ["rubicon", "rubicon_mcp", "rubicon_llm"]
+py-modules = ["rubicon", "rubicon_mcp", "rubicon_llm", "rubicon_otel"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
