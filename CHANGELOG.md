@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.0 - 2026-11-16
 
 ### Added
 - `PostgresJournal(conninfo, table="rubicon_journal")`, for workers on several machines, with
