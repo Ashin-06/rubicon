@@ -9,6 +9,12 @@
   `compact()`. Tested in CI against PostgreSQL 17, including the crash and maintenance fuzz
   scenarios.
 
+### Fixed
+- Since 0.9.0, sync calls on Python 3.11+ ran with the context vars of the thread's first sync
+  call, not the caller's current ones: a value set later (a request id, the current tracing
+  span) was not seen by tools, checks, undos or confirm. Each call now runs in a copy of the
+  caller's context, as with `asyncio.run()`.
+
 ## 0.9.0 - 2026-11-15
 
 ### Breaking
