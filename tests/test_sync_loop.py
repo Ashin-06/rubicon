@@ -72,3 +72,14 @@ def test_ctrl_c_still_rolls_back():
         pass
     assert state == []
     assert run([{"id": "h", "tool": "hold"}], registry=reg, log=lambda m: None) == {"h": "h"}
+
+
+def test_sync_calls_see_the_callers_context_vars():
+    import contextvars
+    var = contextvars.ContextVar("caller", default="unset")
+    reg = {}
+    tool(lambda: var.get(), name="read", undo=NOOP, registry=reg)
+    run([{"id": "a", "tool": "read"}], registry=reg, log=lambda m: None)  # the loop exists now
+    for value in ("first", "second"):
+        var.set(value)
+        assert run([{"id": "a", "tool": "read"}], registry=reg, log=lambda m: None) == {"a": value}
