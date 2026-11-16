@@ -11,6 +11,7 @@ permissions:
 jobs:
   tests:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -29,7 +30,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Core tests with only pytest installed (proves zero dependencies)
         run: |
-          pip install pytest
+          pip install pytest pytest-timeout
           pytest -q
       - name: Install
         run: pip install -e ".[all,dev]" "${{ matrix.mcp }}"
@@ -51,7 +52,7 @@ jobs:
       - name: Test suite against the installed wheel, outside the source tree
         run: |
           python -m venv /tmp/wheel
-          /tmp/wheel/bin/pip install "$(ls dist/*.whl)[all]" pytest
+          /tmp/wheel/bin/pip install "$(ls dist/*.whl)[all]" pytest pytest-timeout
           cp -r tests /tmp/wheel-tests
           cd /tmp
           /tmp/wheel/bin/python -m pytest -q wheel-tests
