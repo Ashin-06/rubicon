@@ -481,7 +481,8 @@ def _run(coro):
         _THREAD_RUNNER.runner = asyncio.Runner()
     runner = _THREAD_RUNNER.runner
     try:
-        return runner.run(coro)  # Ctrl+C cancels the task, so it still unwinds
+        # the caller's context vars, as asyncio.run() would see them; Ctrl+C cancels the task
+        return runner.run(coro, context=contextvars.copy_context())
     finally:
         # like asyncio.run(): nothing started by this call outlives it
         loop = runner.get_loop()
