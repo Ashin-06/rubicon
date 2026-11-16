@@ -30,6 +30,7 @@ import contextlib
 import contextvars
 import enum
 import functools
+import hashlib
 import heapq
 import inspect
 import json
@@ -46,8 +47,8 @@ from dataclasses import dataclass
 from graphlib import CycleError, TopologicalSorter
 from typing import Callable
 
-__all__ = ["APPROVE_ALL", "FileJournal", "JournalBusy", "NOOP", "PlanFailed", "SQLiteJournal", "TOOLS",
-           "Tool", "Transaction", "UNSET", "acknowledge", "arecover", "arun", "compact", "dead_letters", "order",
+__all__ = ["APPROVE_ALL", "FileJournal", "JournalBusy", "NOOP", "PlanFailed", "PostgresJournal",
+           "SQLiteJournal", "TOOLS", "Tool", "Transaction", "UNSET", "acknowledge", "arecover", "arun", "compact", "dead_letters", "order",
            "recover", "run", "tool", "tools_for_llm"]
 
 _logger = logging.getLogger("rubicon")
@@ -1251,14 +1252,87 @@ class SQLiteJournal:
                 raise
 
 
+class PostgresJournal:
+    """Journal in a PostgreSQL table, for workers on several machines. Needs psycopg 3
+    (`pip install "rubicon-agents[postgres]"`).
+
+        journal = PostgresJournal("postgresql://user@db/app")   # or any psycopg conninfo string
+
+    Writes are serialized with a transaction-level advisory lock, so record ids follow commit
+    order and compact() never drops a record written after it read the journal. lock() is a
+    session-level advisory lock held during recover() and compact(), released by the server if
+    the holder's connection dies. Each call opens its own connection, so put a pooler such as
+    PgBouncer in front for many busy workers.
+    """
+
+    def __init__(self, conninfo, table="rubicon_journal"):
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", table):
+            raise ValueError(f"table must be a plain SQL identifier, got {table!r}")
+        self.conninfo, self.table = conninfo, table
+        # two advisory-lock keys per table: one orders writes, one is the recovery lock
+        digest = hashlib.sha256(f"rubicon:{table}".encode()).digest()
+        self._key = int.from_bytes(digest[:4], "big", signed=True)
+        with self._connect() as db:
+            db.execute(f"CREATE TABLE IF NOT EXISTS {table} ("
+                       "id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "
+                       "tx TEXT NOT NULL, record TEXT NOT NULL)")
+            db.execute(f"CREATE INDEX IF NOT EXISTS {table}_tx ON {table} (tx)")
+
+    def __repr__(self):
+        return f"PostgresJournal(table={self.table!r})"  # the conninfo may hold a password
+
+    def _connect(self):
+        import psycopg
+        return psycopg.connect(self.conninfo, autocommit=False)
+
+    def append(self, records):
+        rows = [(r.get("tx", ""), json.dumps(r, default=repr)) for r in records]
+        with self._connect() as db:  # commits on success, rolls back on error
+            db.execute("SELECT pg_advisory_xact_lock(%s, 1)", (self._key,))
+            with db.cursor() as cur:
+                cur.executemany(f"INSERT INTO {self.table} (tx, record) VALUES (%s, %s)", rows)
+
+    def records(self):
+        with self._connect() as db:
+            return [json.loads(row[0]) for row in
+                    db.execute(f"SELECT record FROM {self.table} ORDER BY id").fetchall()]
+
+    @contextlib.contextmanager
+    def lock(self):
+        with self._connect() as db:
+            db.autocommit = True
+            if not db.execute("SELECT pg_try_advisory_lock(%s, 2)", (self._key,)).fetchone()[0]:
+                raise JournalBusy(f"{self!r} is locked by another process")
+            try:
+                yield self
+            finally:
+                db.execute("SELECT pg_advisory_unlock(%s, 2)", (self._key,))
+
+    def drop(self, tx_ids, upto=None):
+        """Remove the records of these transactions; with upto, only among the first `upto`
+        records (ones written since compact() read the journal stay)."""
+        tx_ids = list(tx_ids)
+        with self._connect() as db:  # one transaction: all or nothing
+            db.execute("SELECT pg_advisory_xact_lock(%s, 1)", (self._key,))
+            last = None
+            if upto is not None:  # the id of the last record compact() saw
+                row = db.execute(f"SELECT id FROM {self.table} ORDER BY id LIMIT 1 OFFSET %s",
+                                 (max(upto - 1, 0),)).fetchone()
+                last = row[0] if row and upto > 0 else -1
+            if last is None:
+                db.execute(f"DELETE FROM {self.table} WHERE tx = ANY(%s)", (tx_ids,))
+            else:
+                db.execute(f"DELETE FROM {self.table} WHERE tx = ANY(%s) AND id <= %s", (tx_ids, last))
+
+
 def _as_journal(journal):
     if journal is None:
         return None
     if isinstance(journal, (str, os.PathLike)):
         return FileJournal(journal)
     if not (callable(getattr(journal, "append", None)) and callable(getattr(journal, "records", None))):
-        raise TypeError("journal must be a path, FileJournal, SQLiteJournal, or an object with "
-                        "append(records) and records() methods")
+        raise TypeError("journal must be a path, FileJournal, SQLiteJournal, PostgresJournal, or an "
+                        "object with append(records) and records() methods")
     return journal
 
 
