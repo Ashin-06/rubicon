@@ -43,6 +43,7 @@ The core is one file with no dependencies beyond the Python standard library.
 - [Plan format](#plan-format)
 - [Tools: undo, checks, previews, retries](#tools-undo-checks-previews-retries)
 - [MCP servers](#mcp-servers)
+- [LangGraph](#langgraph)
 - [Let a model write the plan](#let-a-model-write-the-plan)
 - [Crash safety: journals and recovery](#crash-safety-journals-and-recovery)
 - [Events, logging and parallel steps](#events-logging-and-parallel-steps)
@@ -116,6 +117,7 @@ The package is called `rubicon-agents`; you import it as `rubicon` (plus `rubico
 | `openai` | `openai` | `plan_with_openai` (OpenAI and compatible servers) |
 | `mcp` | `mcp` | `register_mcp` |
 | `postgres` | `psycopg` 3 | `PostgresJournal` |
+| `langgraph` | `langgraph` | `rubicon_langgraph.Guard` |
 | `all` | all of the above | |
 | `dev` | `pytest`, `pytest-cov`, `pytest-timeout` | running the tests |
 
@@ -390,6 +392,33 @@ labels each tool:
 - Text results that are JSON are parsed; `"NaN"` and `"Infinity"` stay text. Images and other
   non-text content are returned instead of dropped. An error result raises with the server's
   message.
+
+## LangGraph
+
+`rubicon_langgraph.Guard` puts one `Transaction` behind a LangGraph agent. Its tools go into a
+`ToolNode`; undoable ones run at once, permanent ones are checked and scheduled. A commit node at
+the end of the graph asks for confirmation as a human-in-the-loop interrupt, then commits.
+
+```python
+from langgraph.types import Command
+from rubicon_langgraph import Guard
+
+guard = Guard(registry)
+builder.add_node("tools", ToolNode(guard.tools(), handle_tool_errors=True))
+builder.add_node("commit", guard.commit_node)          # acommit_node for ainvoke
+graph = builder.compile(checkpointer=MemorySaver())    # interrupts need a checkpointer
+
+with guard:                                            # an error in the graph rolls back
+    out = graph.invoke(inputs, config)                 # out["__interrupt__"][0].value["steps"]
+    graph.invoke(Command(resume=True), config)         # only True approves
+print(guard.results or guard.failure)
+```
+
+The interrupt's value is `{"rubicon": "confirm", "steps": [...]}`, with each step's id, tool,
+resolved arguments and check preview. Any resume value other than `True` rolls back. The
+`Transaction` lives in the process that runs the graph, so resume there.
+[`examples/langgraph_agent.py`](https://github.com/Ashin-06/rubicon/blob/main/examples/langgraph_agent.py)
+runs offline with a stub model: `python examples/langgraph_agent.py` (or `--no` to decline).
 
 ## Let a model write the plan
 
@@ -741,6 +770,7 @@ pytest tests/test_confirm.py   # one area: the fail-closed confirmation gate
 | `tests/test_core.py` | ordering, checks, the gate, rollback, `Transaction`, journals, recovery, dead letters, compaction |
 | `tests/test_confirm.py` | missing, raising, truthy-but-not-`True` and async-failing confirms never run a permanent step |
 | `tests/test_sync_loop.py` | sync calls reuse one event loop per thread, stay fast and still unwind on Ctrl+C |
+| `tests/test_langgraph.py` | the LangGraph guard: interrupt, approve, decline, errors, async graphs, the example |
 | `tests/test_mcp.py` | MCP adapter against an in-memory MCP server |
 | `tests/test_llm.py` | planners and `agent()` with stub clients |
 | `tests/test_fuzz.py` | randomised invariants, below |

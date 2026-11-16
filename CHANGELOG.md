@@ -8,6 +8,9 @@
   `records`, `lock()` through a PostgreSQL advisory lock, and `drop(tx_ids, upto)` for
   `compact()`. Tested in CI against PostgreSQL 17, including the crash and maintenance fuzz
   scenarios.
+- `rubicon_langgraph.Guard`: Transaction-guarded tools for a LangGraph agent, a commit node that
+  asks for confirmation as a human-in-the-loop interrupt, and rollback on errors. New
+  `langgraph` extra and a runnable example, `examples/langgraph_agent.py`.
 
 ## 0.9.0 - 2026-11-15
 
