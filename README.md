@@ -785,6 +785,7 @@ To report a vulnerability, see [SECURITY.md](https://github.com/Ashin-06/rubicon
 
 The suite has 172 pytest tests with 94% line coverage, grouped by feature under
 `tests/`. No API keys or network are needed.
+Rollback correctness under injected failures: [docs/BENCHMARK.md](docs/BENCHMARK.md).
 
 ```bash
 pip install -e ".[all,dev]"
