@@ -399,6 +399,8 @@ labels each tool:
   non-text content are returned instead of dropped. An error result raises with the server's
   message.
 
+A runnable end-to-end example with a real stdio server: [examples/mcp_agent_demo](examples/mcp_agent_demo/).
+
 ## LangGraph
 
 `rubicon_langgraph.Guard` puts one `Transaction` behind a LangGraph agent. Its tools go into a

@@ -135,7 +135,7 @@ async def register_mcp(session, *, prefix="", trust_readonly=False, undo=None, c
     undo, checks = undo or {}, checks or {}
     reg = TOOLS if registry is None else registry
 
-    async def call(name, **args):
+    async def call(name, /, **args):
         r = await session.call_tool(name, args)
         content = r.content or []
         text = "\n".join(c.text for c in content if getattr(c, "text", None) is not None)
