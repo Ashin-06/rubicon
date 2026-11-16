@@ -115,8 +115,9 @@ The package is called `rubicon-agents`; you import it as `rubicon` (plus `rubico
 | `claude` | `anthropic` | `plan_with_claude` |
 | `openai` | `openai` | `plan_with_openai` (OpenAI and compatible servers) |
 | `mcp` | `mcp` | `register_mcp` |
+| `postgres` | `psycopg` 3 | `PostgresJournal` |
 | `all` | all of the above | |
-| `dev` | `pytest`, `pytest-cov` | running the tests |
+| `dev` | `pytest`, `pytest-cov`, `pytest-timeout` | running the tests |
 
 For example `pip install -e ".[gemini,mcp]"`.
 
@@ -491,18 +492,19 @@ processes are gone.
 ### Where the journal lives
 
 ```python
-from rubicon import FileJournal, SQLiteJournal
+from rubicon import FileJournal, PostgresJournal, SQLiteJournal
 
 run(plan, journal="rubicon.jsonl")                  # same as FileJournal("rubicon.jsonl")
 run(plan, journal=SQLiteJournal("rubicon.db"))      # many processes and threads on one machine
-run(plan, journal=MyPostgresJournal(...))           # several machines: bring your own store
+run(plan, journal=PostgresJournal("postgresql://app@db/app"))  # several machines
 ```
 
 | Journal | Use it for |
 |---|---|
 | `FileJournal(path)` | One machine. JSON lines, each write flushed and fsynced; writers in several processes take turns through an OS file lock. |
 | `SQLiteJournal(path)` | One machine, many processes or threads. Standard library only (WAL mode, full sync). |
-| Your own object | Several machines (Postgres, Redis, a queue). See below. |
+| `PostgresJournal(conninfo, table="rubicon_journal")` | Several machines sharing one PostgreSQL database. Needs the `postgres` extra. Writes take a transaction-level advisory lock, so record order is commit order; `lock()` is a session advisory lock the server releases if the holder dies. |
+| Your own object | Another shared store (Redis, a queue). See below. |
 
 Your own journal needs `append(records)` (store a list of JSON-serializable dicts, in order,
 atomically) and `records()` (return them all, oldest first). Optionally:
@@ -637,7 +639,7 @@ python demo.py claude --yes    # approve the permanent steps unattended (APPROVE
 | `dead_letters(journal)` | Steps that need a person, oldest first. |
 | `acknowledge(journal, tx, step=None, note="")` | Mark a dead letter, or a whole transaction, as handled. |
 | `compact(journal)` | Remove settled transactions; returns how many. |
-| `FileJournal(path)`, `SQLiteJournal(path)` | Built-in journals. `journal=` also accepts a path or your own object. |
+| `FileJournal(path)`, `SQLiteJournal(path)`, `PostgresJournal(conninfo, table=...)` | Built-in journals. `journal=` also accepts a path or your own object. |
 | `JournalBusy` | Raised when another process holds the journal's lock. |
 | `tools_for_llm(registry=None)` | Tools as `{name, description, reversible, parameters}`, with JSON Schema parameters. |
 | `Tool` | A registered tool (`fn`, `undo`, `check`, `retries`, `undo_retries`, `timeout`, `reversible`). |
