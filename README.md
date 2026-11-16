@@ -394,6 +394,7 @@ labels each tool:
 - Text results that are JSON are parsed; `"NaN"` and `"Infinity"` stay text. Images and other
   non-text content are returned instead of dropped. An error result raises with the server's
   message.
+A runnable end-to-end example with a real stdio server: [examples/mcp_agent_demo](examples/mcp_agent_demo/).
 
 ## LangGraph
 
