@@ -27,6 +27,51 @@ def _scratch(tmp_path_factory):
     tempfile.tempdir = previous
 
 
+def expect(exc, fn, *a, **k):
+    try:
+        fn(*a, **k)
+    except exc as e:
+        return e
+    raise AssertionError(f"expected {exc.__name__}")
+
+
+class FakeServer:
+    """An MCP session stand-in: lists the given tools and answers every call with `result`."""
+    def __init__(self, tools, result=None):
+        self.tools, self.result, self.sent = tools, result, []
+
+    async def list_tools(self):
+        return NS(tools=self.tools, nextCursor=None)
+
+    async def call_tool(self, name, args):
+        self.sent.append((name, args))
+        return self.result or NS(content=[NS(text="ok")], isError=False, structuredContent=None)
+
+
+def spec(name, schema=None, ro=None, destructive=None):
+    ann = None if ro is None else ToolAnnotations(readOnlyHint=ro, destructiveHint=destructive)
+    return NS(name=name, description="", annotations=ann, inputSchema=schema)
+
+
+class Pages:
+    def __init__(self, style, loop_forever=False):
+        self.loop_forever = loop_forever
+        pages = {None: (["a", "b"], "c1"), "c1": (["c"], "c2"), "c2": (["d"], None)}
+        self.pages = pages
+        if style == "params":
+            async def list_tools(*, params=None):
+                return self.page(params.cursor if params else None, "next_cursor")
+        else:
+            async def list_tools(cursor=None):
+                return self.page(cursor, "nextCursor")
+        self.list_tools = list_tools
+
+    def page(self, cursor, field):
+        names, nxt = self.pages[cursor]
+        nxt = "c1" if self.loop_forever and cursor == "c1" else nxt
+        return NS(tools=[NS(name=n) for n in names], **{field: nxt})
+
+
 def test_live_server_round_trip():
     try:  # MCP SDK 2.x
         from mcp import Client
@@ -194,26 +239,7 @@ def test_live_server_round_trip():
 
 
 def test_pagination_both_sdk_styles_plus_a_server_that_repeats():
-    global Pages
     # Pagination, both SDK styles, plus a server that repeats its cursor.
-    class Pages:
-        def __init__(self, style, loop_forever=False):
-            self.loop_forever = loop_forever
-            pages = {None: (["a", "b"], "c1"), "c1": (["c"], "c2"), "c2": (["d"], None)}
-            self.pages = pages
-            if style == "params":
-                async def list_tools(*, params=None):
-                    return self.page(params.cursor if params else None, "next_cursor")
-            else:
-                async def list_tools(cursor=None):
-                    return self.page(cursor, "nextCursor")
-            self.list_tools = list_tools
-
-        def page(self, cursor, field):
-            names, nxt = self.pages[cursor]
-            nxt = "c1" if self.loop_forever and cursor == "c1" else nxt
-            return NS(tools=[NS(name=n) for n in names], **{field: nxt})
-
     for style in ("params", "cursor"):
         assert [t.name for t in asyncio.run(list_all_tools(Pages(style)))] == ["a", "b", "c", "d"]
     assert [t.name for t in asyncio.run(list_all_tools(Pages("cursor", loop_forever=True)))] == ["a", "b", "c"]
@@ -287,32 +313,9 @@ def test_a_session_whose_list_tools_signature_can_t_be_inspected():
 
 
 def test_odd_but_valid_schemas_hostile_servers_and_contradictory():
-    global Server, bad, expect, spec
     # Odd but valid schemas, hostile servers and contradictory hints (independent audit, 0.8.6).
-    def expect(exc, fn, *a, **k):
-        try:
-            fn(*a, **k)
-        except exc as e:
-            return e
-        raise AssertionError(f"expected {exc.__name__}")
-
-    class Server:
-        def __init__(self, tools, result=None):
-            self.tools, self.result, self.sent = tools, result, []
-
-        async def list_tools(self):
-            return NS(tools=self.tools, nextCursor=None)
-
-        async def call_tool(self, name, args):
-            self.sent.append((name, args))
-            return self.result or NS(content=[NS(text="ok")], isError=False, structuredContent=None)
-
-    def spec(name, schema=None, ro=None, destructive=None):
-        ann = None if ro is None else ToolAnnotations(readOnlyHint=ro, destructiveHint=destructive)
-        return NS(name=name, description="", annotations=ann, inputSchema=schema)
-
     # names that can't be Python parameters are still checked, before anything runs
-    mail = Server([spec("send", {"type": "object", "properties": {"from": {"type": "string"},
+    mail = FakeServer([spec("send", {"type": "object", "properties": {"from": {"type": "string"},
                                                                    "to": {"type": "string"}},
                                  "required": ["to"], "additionalProperties": False})])
     odd = {}
@@ -336,7 +339,7 @@ def test_odd_but_valid_schemas_hostile_servers_and_contradictory():
 
 def test_boolean_property_schemas_a_required_that_isn_t_a_list():
     # boolean property schemas, a "required" that isn't a list, and taken **extra names
-    weird = Server([spec("b", {"properties": {"a": True}}), spec("r", {"required": "flight"}),
+    weird = FakeServer([spec("b", {"properties": {"a": True}}), spec("r", {"required": "flight"}),
                     spec("e", {"properties": {"extra": {}, "extra_args": {}, "_extra": {}},
                                "additionalProperties": True})])
     asyncio.run(register_mcp(weird, registry={}))
@@ -347,22 +350,21 @@ def test_boolean_property_schemas_a_required_that_isn_t_a_list():
 
 def test_a_tool_listed_twice_can_t_be_labelled_reliably():
     # a tool listed twice can't be labelled reliably: refused
-    expect(ValueError, lambda: asyncio.run(register_mcp(Server([spec("t", ro=True), spec("t", ro=False)]),
+    expect(ValueError, lambda: asyncio.run(register_mcp(FakeServer([spec("t", ro=True), spec("t", ro=False)]),
                                                         registry={}, trust_readonly=True)))
 
 
 def test_read_only_and_destructive_at_once():
     # read-only and destructive at once: treated as permanent
     hints = {}
-    asyncio.run(register_mcp(Server([spec("both", ro=True, destructive=True), spec("ro", ro=True)]),
+    asyncio.run(register_mcp(FakeServer([spec("both", ro=True, destructive=True), spec("ro", ro=True)]),
                              registry=hints, trust_readonly=True))
     assert not hints["both"].reversible and hints["ro"].reversible
 
 
 def test_an_error_result_with_only_structured_content_keeps_its():
-    global call, e
     # an error result with only structured content keeps its message
-    failing = Server([spec("q")], NS(content=[], isError=True, structuredContent={"error": "quota exceeded"}))
+    failing = FakeServer([spec("q")], NS(content=[], isError=True, structuredContent={"error": "quota exceeded"}))
     call = asyncio.run(register_mcp(failing, registry={}))
     try:
         asyncio.run(call("q"))
@@ -372,9 +374,8 @@ def test_an_error_result_with_only_structured_content_keeps_its():
 
 
 def test_a_successful_call_whose_text_is_nested_too_deeply_to():
-    global call
     # a successful call whose text is nested too deeply to parse is still a success
-    deep = Server([spec("d")], NS(content=[NS(text="[" * 5000 + "]" * 5000)], isError=False, structuredContent=None))
+    deep = FakeServer([spec("d")], NS(content=[NS(text="[" * 5000 + "]" * 5000)], isError=False, structuredContent=None))
     call = asyncio.run(register_mcp(deep, registry={}))
     deep_result = asyncio.run(call("d"))  # parsed where the stack allows it, else the text itself
     assert isinstance(deep_result, list) or deep_result.startswith("[[["), type(deep_result)
