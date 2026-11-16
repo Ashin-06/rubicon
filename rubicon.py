@@ -720,6 +720,7 @@ class Transaction:
         """Journal that everything so far is committed or undone. While an earlier undo is still
         owed (tx.undo_failed), write "settled" instead of "finished" so recover() retries it.
         Writes nothing if no step ran since the last settle (no empty or duplicate records)."""
+        self._emit("tx_settled", status=status, undo_failed=list(self.undo_failed))
         if self._dirty:
             self._write("finished" if not self.undo_failed else "settled", status=status)
             self._dirty = False
@@ -882,6 +883,7 @@ class Transaction:
         self._emit("gate_confirmed", steps=ids)
 
     async def _fail(self, step, cause, not_run=()):
+        self._emit("tx_failed", step=step, error=repr(cause), not_run=list(not_run))
         undone, failed = await self.arollback()
         return PlanFailed(step, cause, undone, list(self.committed), failed, dict(self.results), not_run)
 

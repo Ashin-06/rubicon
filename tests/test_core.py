@@ -462,7 +462,7 @@ def test_happy_path_with_structured_events():
     assert db["bookings"] == set() and db["outbox"] == [("me@example.com", "held AI101")]
     assert r["hold"] == {"flight": "AI101"}
     kinds = [ev["event"] for ev in events]
-    assert kinds[:2] == ["step_started", "step_done"] and "gate_confirmed" in kinds and kinds[-1] == "step_committed"
+    assert kinds[:2] == ["step_started", "step_done"] and "gate_confirmed" in kinds and kinds[-2:] == ["step_committed", "tx_settled"]
     assert all("duration_ms" in ev for ev in events if ev["event"] in ("step_done", "step_committed"))
     reset()
 

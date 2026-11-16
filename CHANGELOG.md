@@ -8,6 +8,11 @@
   `records`, `lock()` through a PostgreSQL advisory lock, and `drop(tx_ids, upto)` for
   `compact()`. Tested in CI against PostgreSQL 17, including the crash and maintenance fuzz
   scenarios.
+- `rubicon_otel.tracing()`, an `on_event` callback that records OpenTelemetry spans: one per
+  transaction (or stage), with child spans for steps, checks, the gate, undos and the failure.
+  New `otel` extra (`opentelemetry-api`).
+- Two events: `tx_failed` (the failing step, the error, and what did not run) and `tx_settled`
+  (once per commit or rollback, with its status and any undo still owed).
 
 ### Fixed
 - Since 0.9.0, sync calls on Python 3.11+ ran with the context vars of the thread's first sync

@@ -46,6 +46,7 @@ The core is one file with no dependencies beyond the Python standard library.
 - [Let a model write the plan](#let-a-model-write-the-plan)
 - [Crash safety: journals and recovery](#crash-safety-journals-and-recovery)
 - [Events, logging and parallel steps](#events-logging-and-parallel-steps)
+- [OpenTelemetry](#opentelemetry)
 - [Async](#async)
 - [Multiple agents in one process](#multiple-agents-in-one-process)
 - [Live demo](#live-demo)
@@ -116,8 +117,9 @@ The package is called `rubicon-agents`; you import it as `rubicon` (plus `rubico
 | `openai` | `openai` | `plan_with_openai` (OpenAI and compatible servers) |
 | `mcp` | `mcp` | `register_mcp` |
 | `postgres` | `psycopg` 3 | `PostgresJournal` |
+| `otel` | `opentelemetry-api` | `rubicon_otel.tracing()` |
 | `all` | all of the above | |
-| `dev` | `pytest`, `pytest-cov`, `pytest-timeout` | running the tests |
+| `dev` | `pytest`, `pytest-cov`, `pytest-timeout`, `opentelemetry-sdk` | running the tests |
 
 For example `pip install -e ".[gemini,mcp]"`.
 
@@ -562,7 +564,9 @@ run(plan, log=print)           # progress messages somewhere other than logging
 - `on_event` receives dicts such as `{"event": "step_done", "step": "hold", "tool": "hold_seat",
   "duration_ms": 12.3, "tx": "...", "time": ...}`. Events: `step_started`, `step_done`,
   `step_failed`, `check_passed`, `gate_confirmed`, `gate_declined`, `step_committed`,
-  `step_undone`, `undo_failed`. Forward them to your logger or tracing system.
+  `step_undone`, `undo_failed`, `tx_failed` (with the failing step, the error and what did not
+  run) and `tx_settled` (status `committed`, `rolled_back` or `step_failed`, once per
+  commit or rollback). Forward them to your logger, or to OpenTelemetry with `rubicon_otel`.
 - If an `on_event` or `log` callback raises, the error is logged as a warning and execution
   carries on unchanged.
 - The library logs to the standard `logging` module under the name `"rubicon"`: progress at
@@ -571,6 +575,29 @@ run(plan, log=print)           # progress messages somewhere other than logging
   fails, or the run is cancelled or interrupted, the rest of the wave is stopped first and then
   everything completed is undone, so no step can finish after the rollback. Permanent steps
   always run one at a time, in order.
+
+## OpenTelemetry
+
+`rubicon_otel.tracing()` is an `on_event` callback that records each transaction as a span tree,
+under whatever span is current when it starts:
+
+```python
+from rubicon_otel import tracing
+
+run(plan, confirm=ask, on_event=tracing())        # uses the globally configured tracer provider
+```
+
+| Span | Covers | Attributes (all `rubicon.*`) |
+|---|---|---|
+| `rubicon.transaction` | one plan, or one stage of a `Transaction` | `tx`, `status`, `undo_failed` |
+| `rubicon.step <tool>` | a step, from start to done, committed or failed | `step`, `tool`, `permanent`, `outcome`, `duration_ms` |
+| `rubicon.check <tool>` | a check that passed | `step`, `tool`, `preview` |
+| `rubicon.gate` | the confirmation | `steps`, `confirmed` |
+| `rubicon.undo <tool>` | an undo that ran or failed | `step`, `tool` |
+| `rubicon.failure` | the failure that started a rollback | `step`, `error`, `not_run` |
+
+Failed steps and undos, a declined gate, and a transaction that failed or still owes an undo get
+status `ERROR`. Previews and errors become span attributes, so keep secrets out of them.
 
 ## Async
 
@@ -741,6 +768,7 @@ pytest tests/test_confirm.py   # one area: the fail-closed confirmation gate
 | `tests/test_core.py` | ordering, checks, the gate, rollback, `Transaction`, journals, recovery, dead letters, compaction |
 | `tests/test_confirm.py` | missing, raising, truthy-but-not-`True` and async-failing confirms never run a permanent step |
 | `tests/test_sync_loop.py` | sync calls reuse one event loop per thread, stay fast and still unwind on Ctrl+C |
+| `tests/test_otel.py` | OpenTelemetry spans, checked with the in-memory exporter |
 | `tests/test_mcp.py` | MCP adapter against an in-memory MCP server |
 | `tests/test_llm.py` | planners and `agent()` with stub clients |
 | `tests/test_fuzz.py` | randomised invariants, below |
