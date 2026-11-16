@@ -456,6 +456,42 @@ def _takes_args(undo) -> bool:
                                      or positional[1].name == "args")
 
 
+class _ThreadRunner(threading.local):
+    """One event loop per thread for sync calls, closed when the thread ends.
+
+    A new loop per call opens a loopback socket pair each time; on Windows, thousands of them in a
+    row can leave a new loop stuck in accept(). Reusing the loop also makes each call cheaper.
+    """
+
+    runner = None
+
+    def __del__(self):
+        if self.runner is not None:
+            with contextlib.suppress(Exception):
+                self.runner.close()
+
+
+_THREAD_RUNNER = _ThreadRunner()
+
+
+def _run(coro):
+    if not hasattr(asyncio, "Runner"):  # Python 3.10
+        return asyncio.run(coro)
+    if _THREAD_RUNNER.runner is None:
+        _THREAD_RUNNER.runner = asyncio.Runner()
+    runner = _THREAD_RUNNER.runner
+    try:
+        return runner.run(coro)  # Ctrl+C cancels the task, so it still unwinds
+    finally:
+        # like asyncio.run(): nothing started by this call outlives it
+        loop = runner.get_loop()
+        leftover = asyncio.all_tasks(loop)
+        for task in leftover:
+            task.cancel()
+        if leftover:
+            loop.run_until_complete(asyncio.gather(*leftover, return_exceptions=True))
+
+
 def _sync(coro, drive=False):
     """Run a coroutine from sync code.
 
@@ -465,7 +501,7 @@ def _sync(coro, drive=False):
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(coro)
+        return _run(coro)
     if drive:
         token = _DRIVING.set(True)
         try:

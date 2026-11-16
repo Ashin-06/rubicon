@@ -20,9 +20,17 @@
   never run a permanent step, across `run`, `arun`, `Transaction` (sync and async) and `agent`.
 - `demo.py --yes` approves unattended with `APPROVE_ALL`.
 
+### Fixed
+- Sync calls (`run()`, `tx.call()`, `tx.commit()` outside an event loop) reuse one event loop per
+  thread instead of starting a new one each time. On Windows, thousands of new loops in a row
+  could leave one stuck opening its loopback socket pair, and each call is now cheaper. Anything a
+  call starts is still cancelled before it returns. Python 3.10 keeps a new loop per call.
+
 ### Changed
 - Tests are grouped by area (`test_core.py`, `test_confirm.py`, `test_mcp.py`, `test_llm.py`,
   `test_fuzz.py`); the README lists the test count and coverage.
+- A test that hangs fails after two minutes (`pytest-timeout`, in the `dev` extra), and a CI
+  job after twenty.
 - CI pins every action by commit SHA, runs the core tests with only pytest installed, and runs the
   suite against the installed wheel.
 

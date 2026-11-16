@@ -725,7 +725,7 @@ To report a vulnerability, see [SECURITY.md](https://github.com/Ashin-06/rubicon
 
 ## Testing
 
-The suite has 169 pytest tests with 94% line coverage, grouped by feature under
+The suite has 173 pytest tests with 94% line coverage, grouped by feature under
 `tests/`. No API keys or network are needed.
 
 ```bash
@@ -738,6 +738,7 @@ pytest tests/test_confirm.py   # one area: the fail-closed confirmation gate
 |---|---|
 | `tests/test_core.py` | ordering, checks, the gate, rollback, `Transaction`, journals, recovery, dead letters, compaction |
 | `tests/test_confirm.py` | missing, raising, truthy-but-not-`True` and async-failing confirms never run a permanent step |
+| `tests/test_sync_loop.py` | sync calls reuse one event loop per thread, stay fast and still unwind on Ctrl+C |
 | `tests/test_mcp.py` | MCP adapter against an in-memory MCP server |
 | `tests/test_llm.py` | planners and `agent()` with stub clients |
 | `tests/test_fuzz.py` | randomised invariants, below |
