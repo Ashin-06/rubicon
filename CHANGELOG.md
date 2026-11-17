@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.2 - 2026-11-17
+
+### Documentation
+- The README, CONTRIBUTING.md, RELEASING.md and the MCP demo README match 0.10.x: install from
+  PyPI, every module, test file and environment variable listed, measured test count and
+  coverage, and links that work on the PyPI page. No code changes.
+
 ## 0.10.1 - 2026-11-17
 
 ### Added
