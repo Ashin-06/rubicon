@@ -6,6 +6,8 @@ Releases go to PyPI from GitHub Actions through
 
 ## One-time setup
 
+Already done for `rubicon-agents`; this section is only needed for a fork or a rename.
+
 1. On PyPI, sign in and open **Your account > Publishing**. Under **Add a new pending
    publisher**, choose **GitHub** and enter:
 
@@ -23,17 +25,15 @@ Releases go to PyPI from GitHub Actions through
    `pypi`, and (recommended) add yourself under **Required reviewers**, so every upload waits
    for your approval.
 
-Optionally repeat both steps on [TestPyPI](https://test.pypi.org) to rehearse.
-
 ## Each release
 
-1. Set `version` in `pyproject.toml` and move the `Unreleased` section of `CHANGELOG.md` under
-   the new version, in a pull request. Merge it once CI is green.
+1. Set `version` in `pyproject.toml` and add a `## X.Y.Z - date` section to `CHANGELOG.md`
+   (moving any `## Unreleased` notes into it), in a pull request. Merge it once CI is green.
 2. Tag the merge commit and publish a GitHub release whose notes are that CHANGELOG section:
 
    ```bash
-   git tag -a v0.10.0 -m 0.10.0 && git push origin v0.10.0
-   gh release create v0.10.0 --verify-tag --title 0.10.0 --notes-file notes.md
+   git tag -a vX.Y.Z -m X.Y.Z && git push origin vX.Y.Z
+   gh release create vX.Y.Z --verify-tag --title X.Y.Z --notes-file notes.md
    ```
 
 3. Publishing the release starts `publish.yml`. It checks that the tag matches the package

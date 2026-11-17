@@ -98,12 +98,6 @@ It is not the right tool when:
 pip install rubicon-agents
 ```
 
-Until the first PyPI release is out, install it from GitHub:
-
-```bash
-pip install "rubicon-agents @ git+https://github.com/Ashin-06/rubicon.git"
-```
-
 or from a clone, for development:
 
 ```bash
@@ -112,8 +106,8 @@ cd rubicon
 pip install -e .
 ```
 
-The package is called `rubicon-agents`; you import it as `rubicon` (plus `rubicon_llm` and
-`rubicon_mcp`). The core needs nothing else. Optional extras add the integrations:
+The package is called `rubicon-agents`; you import it as `rubicon` (plus `rubicon_llm`,
+`rubicon_mcp`, `rubicon_otel` and `rubicon_langgraph`). The core needs nothing else. Optional extras add the integrations:
 
 | Extra | Adds | For |
 |---|---|---|
@@ -127,7 +121,7 @@ The package is called `rubicon-agents`; you import it as `rubicon` (plus `rubico
 | `all` | all of the above | |
 | `dev` | `pytest`, `pytest-cov`, `pytest-timeout`, `opentelemetry-sdk` | running the tests |
 
-For example `pip install -e ".[gemini,mcp]"`.
+For example `pip install "rubicon-agents[gemini,mcp]"`.
 
 > The import name `rubicon` is also used by BeeWare's `rubicon-objc` (used by Toga and
 > Briefcase on macOS and iOS). Don't install both into the same environment.
@@ -399,7 +393,7 @@ labels each tool:
   non-text content are returned instead of dropped. An error result raises with the server's
   message.
 
-A runnable end-to-end example with a real stdio server: [examples/mcp_agent_demo](examples/mcp_agent_demo/).
+A runnable end-to-end example with a real stdio server: [examples/mcp_agent_demo](https://github.com/Ashin-06/rubicon/tree/main/examples/mcp_agent_demo).
 
 ## LangGraph
 
@@ -441,7 +435,7 @@ agent("...", planner=partial(plan_with_openai, model="llama3.3",     # Ollama, L
                              base_url="http://localhost:11434/v1"))  # vLLM, Groq, OpenRouter, ...
 ```
 
-| Planner | Extra | Key | Default model (0.8.x) |
+| Planner | Extra | Key | Default model |
 |---|---|---|---|
 | `plan_with_gemini` | `gemini` | `GEMINI_API_KEY` or `GOOGLE_API_KEY` | `gemini-3.5-flash` |
 | `plan_with_claude` | `claude` | `ANTHROPIC_API_KEY` | `claude-opus-5-5` |
@@ -789,9 +783,11 @@ To report a vulnerability, see [SECURITY.md](https://github.com/Ashin-06/rubicon
 
 ## Testing
 
-The suite has 172 pytest tests with 94% line coverage, grouped by feature under
-`tests/`. No API keys or network are needed.
-Rollback correctness under injected failures: [docs/BENCHMARK.md](docs/BENCHMARK.md).
+The suite has 235 pytest tests with 91% line coverage, grouped by feature under
+`tests/`. No API keys or network are needed. The PostgreSQL tests are skipped unless
+`RUBICON_PG_DSN` points at a database (`RUBICON_FUZZ_PG` sets their fuzz count, default 100).
+Rollback correctness under injected failures:
+[docs/BENCHMARK.md](https://github.com/Ashin-06/rubicon/blob/main/docs/BENCHMARK.md).
 
 ```bash
 pip install -e ".[all,dev]"
@@ -808,6 +804,9 @@ pytest tests/test_confirm.py   # one area: the fail-closed confirmation gate
 | `tests/test_langgraph.py` | the LangGraph guard: interrupt, approve, decline, errors, async graphs, the example |
 | `tests/test_mcp.py` | MCP adapter against an in-memory MCP server |
 | `tests/test_llm.py` | planners and `agent()` with stub clients |
+| `tests/test_failure_injection.py` | end state after rollback and recovery under real injected HTTP and SQLite failures |
+| `tests/test_mcp_agent_demo.py` | the MCP agent demo, end to end |
+| `tests/test_postgres.py` | `PostgresJournal` contract and fuzz; skipped unless `RUBICON_PG_DSN` is set |
 | `tests/test_fuzz.py` | randomised invariants, below |
 
 Every test starts from a fresh world, so the suite passes in any order; CI also runs it shuffled
@@ -838,7 +837,7 @@ RUBICON_FUZZ_SEED=1234 pytest tests/test_fuzz.py   # replay a reported failure
 
 (On Windows PowerShell, set variables first: `$env:RUBICON_FUZZ=20000; pytest tests/test_fuzz.py`.)
 
-CI runs the core tests with only pytest installed, then the full suite on Python 3.10 to 3.14 on Linux,
+CI runs the core tests with only pytest and pytest-timeout installed, then the full suite on Python 3.10 to 3.14 on Linux,
 Python 3.12 on Windows and macOS, and MCP SDK 1.x and 2.x. It also builds the package and runs
 the suite against the installed wheel.
 
@@ -846,7 +845,11 @@ the suite against the installed wheel.
 rubicon.py        core: registry, ordering, validation, gate, rollback, Transaction, journals
 rubicon_mcp.py    MCP adapter
 rubicon_llm.py    Gemini, Claude and OpenAI-compatible planners, plus bring-your-own-model helpers
+rubicon_otel.py   OpenTelemetry spans and events
+rubicon_langgraph.py  LangGraph guard for tool nodes
 demo.py           live demo with fake travel tools
+examples/         LangGraph example and the MCP agent demo
+tools/            rollback_benchmark.py (results in docs/BENCHMARK.md)
 tests/            pytest suite, including the randomised invariant tests
 ```
 

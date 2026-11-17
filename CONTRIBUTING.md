@@ -24,11 +24,14 @@ python -m venv .venv
 . .venv/bin/activate              # Windows: .venv\Scripts\activate
 pip install -e ".[all,dev]"
 pytest                            # everything, no API keys or network needed
+                                  # (PostgreSQL tests run only with RUBICON_PG_DSN set)
 ```
 
 Tests live under `tests/`, one file per area (`test_core.py`, `test_confirm.py`, `test_mcp.py`,
-`test_llm.py`), and `tests/test_fuzz.py` holds the randomised invariant tests. A deeper fuzz run before a pull request that touches execution or
-recovery is appreciated:
+`test_llm.py`, `test_failure_injection.py`, `test_postgres.py` and others), and
+`tests/test_fuzz.py` holds the randomised invariant tests. A deeper fuzz run before a pull request
+that touches execution or recovery is appreciated (PowerShell:
+`$env:RUBICON_FUZZ=5000; pytest tests/test_fuzz.py`):
 
 ```bash
 RUBICON_FUZZ=5000 pytest tests/test_fuzz.py
