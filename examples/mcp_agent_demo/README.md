@@ -4,7 +4,8 @@ An agent works through a real MCP server over stdio, with every tool call guarde
 No API key is needed: the agent's tool calls are scripted.
 
 ```bash
-pip install "rubicon-agents[mcp]"     # or, in a checkout: pip install -e ".[mcp]"
+git clone https://github.com/Ashin-06/rubicon.git && cd rubicon   # the demo is not in the wheel
+pip install -e ".[mcp]"
 python examples/mcp_agent_demo/run_demo.py
 ```
 
@@ -36,7 +37,7 @@ python examples/mcp_agent_demo/run_demo.py --workdir out  # keep the workspace i
 python examples/mcp_agent_demo/run_demo.py --llm          # Claude writes the plan instead
 ```
 
-`--llm` needs `ANTHROPIC_API_KEY` in the environment and `pip install anthropic`. The plan Claude
+`--llm` needs `ANTHROPIC_API_KEY` in the environment and `pip install -e ".[mcp,claude]"`. The plan Claude
 writes runs through `rubicon.arun()`, so the message still waits for confirmation.
 
 `tests/test_mcp_agent_demo.py` runs the scripted demo end to end.
