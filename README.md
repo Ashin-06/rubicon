@@ -79,6 +79,19 @@ the place where agent tool calls actually run.
 | The model can't see which tools are dangerous | Reversibility is part of the tool list the model plans against |
 | A crash mid-plan is forgotten | A journal lets `recover()` undo it after a restart |
 
+```mermaid
+flowchart LR
+    Plan["Model Plan (Mixed Undoable & Permanent Steps)"] --> Validate["1. Signature & Dependency Validation"]
+    Validate --> Reorder["2. Topological Reordering (Undoable First, Permanent Last)"]
+    Reorder --> Undoable["3. Execute Undoable Steps (Journaled)"]
+    Undoable -->|"Any Error / Ctrl+C"| Rollback["Reverse-Order Compensating Undo & Journal Recovery"]
+    Undoable -->|"All Succeed"| Precheck["4. Run Pre-Checks & Previews for Permanent Steps"]
+    Precheck -->|"Check Fails"| Rollback
+    Precheck --> Gate["5. Single Human/Policy Confirmation Gate"]
+    Gate -->|"Declined"| Rollback
+    Gate -->|"Approved"| Perm["6. Point of No Return: Execute Permanent Steps"]
+```
+
 ## When to use it, and when not
 
 Use Rubicon when an agent mixes actions you can take back (holds, drafts, reservations,
@@ -788,6 +801,17 @@ The suite has 235 pytest tests with 91% line coverage, grouped by feature under
 `RUBICON_PG_DSN` points at a database (`RUBICON_FUZZ_PG` sets their fuzz count, default 100).
 Rollback correctness under injected failures:
 [docs/BENCHMARK.md](https://github.com/Ashin-06/rubicon/blob/main/docs/BENCHMARK.md).
+
+### Rollback Benchmark Results (300 Trials Under Injected HTTP, SQLite & Crash Faults)
+
+Reproducible via `python tools/rollback_benchmark.py --trials 300 --seed 1`:
+
+| Strategy | Consistent End-State | Left Inconsistent | Flagged for Operator | Leftover Partial Effects | Recovery Latency (Median / P95) |
+|---|---|---|---|---|---|
+| `plain` (plan order, stop on error) | 51.7% | 48.3% | 0 | 0 | - / - |
+| `naive` (`try/except` reverse undo) | 47.3% | 52.7% | 0 | 0 | 0 ms / 7 ms |
+| `toolnode` (LangGraph `ToolNode`) | 54.3% | 45.7% | 0 | 24 (unflagged) | - / - |
+| **`rubicon` (`arun` + `SQLiteJournal` + `arecover`)** | **97.3%** | **2.7%** *(mid-step `os._exit` kills)* | **8 / 8 (100% surfaced as dead letters)** | **8 (100% flagged)** | **2 ms / 33 ms** |
 
 ```bash
 pip install -e ".[all,dev]"
