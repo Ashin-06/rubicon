@@ -1,6 +1,18 @@
 # Changelog
 
-## Unreleased
+## 0.10.1 - 2026-11-17
+
+### Added
+- `tools/rollback_benchmark.py` and `docs/BENCHMARK.md`: a rebooking agent against a real local
+  HTTP service and a real SQLite database with injected timeouts, HTTP 500s, connection resets,
+  slow responses, a locked database and crashes mid-step, comparing naive execution, a plain
+  LangGraph ToolNode and Rubicon. `tests/test_failure_injection.py` checks the end state after
+  rollback and recovery.
+- `examples/mcp_agent_demo/`: a runnable agent against a local MCP stdio server.
+
+### Fixed
+- The `call` function returned by `register_mcp()` takes the tool name positionally only, so a
+  tool argument named `name` no longer collides with it.
 
 ### Packaging
 - A release workflow (`publish.yml`) uploads each published GitHub release to PyPI through
