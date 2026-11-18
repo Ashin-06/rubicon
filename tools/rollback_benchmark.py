@@ -64,8 +64,7 @@ FILLER = "~"  # rows that fill the database in a db_full trial; not notes
 
 
 def _sync(coro):
-    # ponytail: a loop per call. rubicon.run() keeps one loop per thread, which on Windows prints
-    # a Proactor "self pipe" error at interpreter exit; switch back once rubicon.py fixes that.
+    # a fresh event loop per trial keeps trials independent of each other
     return asyncio.run(coro)
 
 

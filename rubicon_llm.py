@@ -399,21 +399,28 @@ def plan_with_gemini(goal, client=None, registry=None, model=None):
     return parse_plan(resp.text, registry)
 
 
-def plan_with_claude(goal, client=None, registry=None, model=None):
-    """Claude via anthropic. Reads ANTHROPIC_API_KEY."""
+def plan_with_claude(goal, client=None, registry=None, model=None, effort="high", fallback=True):
+    """Claude via anthropic. Reads ANTHROPIC_API_KEY. Pass effort=None for models or gateways
+    without the effort setting, and fallback=False where the server-side fallback beta is not
+    available (for example Bedrock or Vertex)."""
     model = model or (os.environ.get("CLAUDE_MODEL") or "").strip() or CLAUDE_MODEL
     req = planning_request(goal, registry)
     if client is None:
         import anthropic
         client = anthropic.Anthropic()
+    output_config = {"format": {"type": "json_schema", "schema": req["schema"]}}
+    if effort:
+        output_config["effort"] = effort
+    extra = {}
+    if fallback:  # retry a refusal on another model; SDK 0.86 has no kwarg for it
+        extra = {"betas": ["server-side-fallback-2026-07-01"], "extra_body": {"fallbacks": "default"}}
     resp = client.beta.messages.create(
         model=model,
         max_tokens=16000,
-        betas=["server-side-fallback-2026-07-01"],
-        extra_body={"fallbacks": "default"},  # retry a refusal on another model; SDK 0.86 has no kwarg
-        output_config={"effort": "high", "format": {"type": "json_schema", "schema": req["schema"]}},
+        output_config=output_config,
         system=req["system"],
         messages=[{"role": "user", "content": req["prompt"]}],
+        **extra,
     )
     if resp.stop_reason != "end_turn":
         raise RuntimeError(f"planner stopped: {resp.stop_reason} {getattr(resp, 'stop_details', '')}")

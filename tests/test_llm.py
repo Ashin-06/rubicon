@@ -160,6 +160,10 @@ def test_claude():
     agent("move", planner=plan_with_claude, client=c, registry=reg, confirm=lambda st: True, log=quiet)
     assert c.kw["model"] == CLAUDE_MODEL and c.kw["extra_body"] == {"fallbacks": "default"}
     assert "refusal" in str(expect(RuntimeError, plan_with_claude, "x", Claude(text, "refusal"), reg))
+    plain = Claude(text)
+    plan_with_claude("x", plain, reg, effort=None, fallback=False)  # gateways without the beta
+    assert "betas" not in plain.kw and "extra_body" not in plain.kw
+    assert "effort" not in plain.kw["output_config"]
 
 
 def test_openai_compatible():
