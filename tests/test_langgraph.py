@@ -107,3 +107,24 @@ def test_async_graph(example):
 
     asyncio.run(go())
     assert guard.failure is None and example["world"]["bookings"] == set()
+
+
+def test_async_with_rolls_back_async_undos():
+    import asyncio
+    from rubicon import tool
+    from rubicon_langgraph import Guard
+    undone = []
+    reg = {}
+
+    async def undo_book(result):
+        undone.append("book")
+
+    tool(lambda: "booked", undo=undo_book, name="book", registry=reg)
+
+    async def main():
+        with pytest.raises(ZeroDivisionError):
+            async with Guard(reg, log=lambda m: None) as g:
+                await g.tx.acall("book")
+                1 / 0
+    asyncio.run(main())
+    assert undone == ["book"]

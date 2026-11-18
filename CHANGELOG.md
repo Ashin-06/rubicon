@@ -2,6 +2,13 @@
 
 ## 0.10.2 - 2026-11-17
 
+### Fixed
+- `rubicon_langgraph.Guard` works as `async with`: on an exception it awaits the rollback, so
+  async undos run instead of failing inside the running event loop.
+- `plan_with_claude(effort=..., fallback=...)`: both can be turned off for models or gateways
+  (Bedrock, Vertex) that reject the effort setting or the server-side fallback beta.
+- The `langgraph` extra declares `langchain-core`, which `rubicon_langgraph` imports directly.
+
 ### Documentation
 - The README, CONTRIBUTING.md, RELEASING.md and the MCP demo README match 0.10.x: install from
   PyPI, every module, test file and environment variable listed, measured test count and

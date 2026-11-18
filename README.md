@@ -545,7 +545,7 @@ run(plan, journal=PostgresJournal("postgresql://app@db/app"))  # several machine
 
 | Journal | Use it for |
 |---|---|
-| `FileJournal(path)` | One machine. JSON lines, each write flushed and fsynced; writers in several processes take turns through an OS file lock. |
+| `FileJournal(path)` | One machine. JSON lines, each write flushed and fsynced; writers in several processes take turns through an OS file lock (the empty `.lock` file next to the journal stays on disk by design). |
 | `SQLiteJournal(path)` | One machine, many processes or threads. Standard library only (WAL mode, full sync). |
 | `PostgresJournal(conninfo, table="rubicon_journal")` | Several machines sharing one PostgreSQL database. Needs the `postgres` extra. Writes take a transaction-level advisory lock, so record order is commit order; `lock()` is a session advisory lock the server releases if the holder dies. |
 | Your own object | Another shared store (Redis, a queue). See below. |
@@ -796,7 +796,7 @@ To report a vulnerability, see [SECURITY.md](https://github.com/Ashin-06/rubicon
 
 ## Testing
 
-The suite has 235 pytest tests with 91% line coverage, grouped by feature under
+The suite has 236 pytest tests with 91% line coverage, grouped by feature under
 `tests/`. No API keys or network are needed. The PostgreSQL tests are skipped unless
 `RUBICON_PG_DSN` points at a database (`RUBICON_FUZZ_PG` sets their fuzz count, default 100).
 Rollback correctness under injected failures:

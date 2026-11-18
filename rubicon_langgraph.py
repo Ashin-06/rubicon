@@ -84,3 +84,12 @@ class Guard:
         if exc_type is not None:
             self.tx.rollback()
         return False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        # inside a running loop the sync rollback cannot run async undos, so await them here
+        if exc_type is not None:
+            await self.tx.arollback()
+        return False
