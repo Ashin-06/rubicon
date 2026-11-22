@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.3 - 2026-11-22
+
+### Fixed
+- A `rubicon_langgraph.Guard` reused for another turn starts with `failure` cleared, so it no longer
+  reports the previous turn's failure.
+
 ## 0.10.2 - 2026-11-17
 
 ### Fixed
