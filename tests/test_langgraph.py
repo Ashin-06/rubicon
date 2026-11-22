@@ -128,3 +128,11 @@ def test_async_with_rolls_back_async_undos():
                 1 / 0
     asyncio.run(main())
     assert undone == ["book"]
+
+
+def test_reused_guard_forgets_the_previous_failure():
+    from rubicon_langgraph import Guard
+    g = Guard({}, log=lambda m: None)
+    g.failure = RuntimeError("last turn")
+    with g:
+        assert g.failure is None

@@ -78,6 +78,7 @@ class Guard:
         return self.tx.rollback()
 
     def __enter__(self):
+        self.failure = None  # a reused guard must not report the previous turn's failure
         return self
 
     def __exit__(self, exc_type, exc, tb):
@@ -86,6 +87,7 @@ class Guard:
         return False
 
     async def __aenter__(self):
+        self.failure = None
         return self
 
     async def __aexit__(self, exc_type, exc, tb):

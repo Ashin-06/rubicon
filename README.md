@@ -616,7 +616,8 @@ run(plan, log=print)           # progress messages somewhere other than logging
 - `parallel=True` runs undoable steps in waves of steps that don't depend on each other. If one
   fails, or the run is cancelled or interrupted, the rest of the wave is stopped first and then
   everything completed is undone, so no step can finish after the rollback. Permanent steps
-  always run one at a time, in order.
+  always run one at a time, in order. A step cancelled mid-flight never recorded a result, so it is
+  not undone: run only steps that are safe to cancel (local or idempotent work) in parallel.
 
 ## OpenTelemetry
 
@@ -796,7 +797,7 @@ To report a vulnerability, see [SECURITY.md](https://github.com/Ashin-06/rubicon
 
 ## Testing
 
-The suite has 236 pytest tests with 91% line coverage, grouped by feature under
+The suite has 237 pytest tests with 91% line coverage, grouped by feature under
 `tests/`. No API keys or network are needed. The PostgreSQL tests are skipped unless
 `RUBICON_PG_DSN` points at a database (`RUBICON_FUZZ_PG` sets their fuzz count, default 100).
 Rollback correctness under injected failures:
