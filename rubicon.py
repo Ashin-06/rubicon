@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import difflib
 import enum
 import functools
 import hashlib
@@ -231,7 +232,18 @@ def _walk(v, f, depth=0):
 def _refs(args, ids) -> list[str]:
     """Step ids referenced as "$id" anywhere in args ("$50" and unknown names are not references)."""
     found = []
-    _walk(args, lambda s: found.extend(m for m, _ in _REF.findall(s) if m in ids) or s)
+
+    def scan(s):
+        for m, _ in _REF.findall(s):
+            if m in ids:
+                found.append(m)
+            else:  # a near miss is almost always a typo the model made; it would be sent as plain text
+                near = difflib.get_close_matches(m, list(ids), n=1, cutoff=0.75)
+                if near:
+                    _logger.warning("$%s is not a step id (did you mean $%s?); it is sent as plain text", m, near[0])
+        return s
+
+    _walk(args, scan)
     return found
 
 

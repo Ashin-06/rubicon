@@ -1611,3 +1611,11 @@ def test_tool_descriptions_see_the_hints_of_partials_and_callable():
         return a
 
     assert _schema(functools.partial(two_args, b="c"))["properties"] == {"a": {"type": "integer"}, "b": {"type": "string"}}
+
+
+def test_near_miss_step_reference_is_logged(caplog):
+    import logging
+    from rubicon import _refs
+    with caplog.at_level(logging.WARNING, logger="rubicon"):
+        assert _refs({"flight": "$hodl.flight", "price": "$50"}, {"hold", "pay"}) == []
+    assert "did you mean $hold" in caplog.text and "$50" not in caplog.text
