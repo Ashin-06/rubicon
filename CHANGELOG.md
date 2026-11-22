@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.4 - 2026-11-23
 
 ### Fixed
 - On Windows, a script that made a sync call (`run()`, `tx.call()`) printed an asyncio
