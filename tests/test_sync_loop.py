@@ -102,7 +102,7 @@ def test_loops_close_when_their_thread_ends_and_at_exit():
         "    run([{'id': 'a', 'tool': 'loop'}], registry=reg, log=lambda m: None)['a']))\n"
         "t.start(); t.join(); del t; gc.collect()\n"
         "assert sys.version_info < (3, 11) or seen[0].is_closed(), 'worker loop left open'\n"
-        "assert not main_loop.is_closed()\n"
+        "assert sys.version_info < (3, 11) or not main_loop.is_closed()\n"  # 3.10: a loop per call
         "print('ok')\n")
     done = subprocess.run([sys.executable, "-W", "error::ResourceWarning", "-c", script],
                           capture_output=True, text=True, timeout=60)
