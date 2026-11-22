@@ -318,8 +318,9 @@ References let a step use an earlier step's result:
   the step, so a message never goes out with a dumped dictionary or object in it.
 - References work inside nested lists and objects and add a dependency automatically.
 - Only real step ids count, and ids can't start with a digit, so `"$50"` stays money. This also
-  means a misspelt reference such as `"$hodl.flight"` is sent as ordinary text. Check the
-  confirmation preview, or validate such values in your tool.
+  means a misspelt reference such as `"$hodl.flight"` is sent as ordinary text; Rubicon logs a
+  warning when it is close to a real id ("did you mean $hold?"). Check the confirmation preview, or
+  validate such values in your tool.
 
 ## Tools: undo, checks, previews, retries
 
@@ -797,7 +798,7 @@ To report a vulnerability, see [SECURITY.md](https://github.com/Ashin-06/rubicon
 
 ## Testing
 
-The suite has 237 pytest tests with 91% line coverage, grouped by feature under
+The suite has 238 pytest tests with 91% line coverage, grouped by feature under
 `tests/`. No API keys or network are needed. The PostgreSQL tests are skipped unless
 `RUBICON_PG_DSN` points at a database (`RUBICON_FUZZ_PG` sets their fuzz count, default 100).
 Rollback correctness under injected failures:

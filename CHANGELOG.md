@@ -1,6 +1,10 @@
 # Changelog
 
-## 0.10.3 - 2026-11-22
+## 0.10.3 - 2026-11-23
+
+### Added
+- A `$reference` that is not a step id but is close to one (`$hodl` for `hold`) logs a warning,
+  "did you mean $hold?", since it is sent as plain text.
 
 ### Fixed
 - A `rubicon_langgraph.Guard` reused for another turn starts with `failure` cleared, so it no longer
