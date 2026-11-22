@@ -83,3 +83,28 @@ def test_sync_calls_see_the_callers_context_vars():
     for value in ("first", "second"):
         var.set(value)
         assert run([{"id": "a", "tool": "read"}], registry=reg, log=lambda m: None) == {"a": value}
+
+
+def test_loops_close_when_their_thread_ends_and_at_exit():
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    script = (
+        "import asyncio, gc, sys, threading\n"
+        f"sys.path.insert(0, {str(Path(__file__).resolve().parent.parent)!r})\n"
+        "from rubicon import NOOP, run, tool\n"
+        "reg = {}\n"
+        "tool(lambda: asyncio.get_running_loop(), name='loop', undo=NOOP, registry=reg)\n"
+        "main_loop = run([{'id': 'a', 'tool': 'loop'}], registry=reg, log=lambda m: None)['a']\n"
+        "seen = []\n"
+        "t = threading.Thread(target=lambda: seen.append(\n"
+        "    run([{'id': 'a', 'tool': 'loop'}], registry=reg, log=lambda m: None)['a']))\n"
+        "t.start(); t.join(); del t; gc.collect()\n"
+        "assert sys.version_info < (3, 11) or seen[0].is_closed(), 'worker loop left open'\n"
+        "assert sys.version_info < (3, 11) or not main_loop.is_closed()\n"  # 3.10: a loop per call
+        "print('ok')\n")
+    done = subprocess.run([sys.executable, "-W", "error::ResourceWarning", "-c", script],
+                          capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0 and done.stdout.strip() == "ok", done.stderr
+    assert done.stderr == "", done.stderr  # nothing printed while the interpreter shuts down

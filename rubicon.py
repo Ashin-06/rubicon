@@ -26,6 +26,7 @@ lists/objects and add a dependency automatically.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextlib
 import contextvars
 import difflib
@@ -469,30 +470,38 @@ def _takes_args(undo) -> bool:
                                      or positional[1].name == "args")
 
 
-class _ThreadRunner(threading.local):
-    """One event loop per thread for sync calls, closed when the thread ends.
+class _Runner:
+    """One event loop per thread for sync calls.
 
     A new loop per call opens a loopback socket pair each time; on Windows, thousands of them in a
     row can leave a new loop stuck in accept(). Reusing the loop also makes each call cheaper.
+    The loop is closed when its thread ends (this object is dropped with the thread's locals) or,
+    for the main thread, at exit, before the interpreter starts tearing things down.
     """
 
-    runner = None
+    def __init__(self):
+        self.runner = asyncio.Runner()
 
-    def __del__(self):
-        if self.runner is not None:
+    def close(self):
+        runner, self.runner = self.runner, None
+        if runner is not None:
             with contextlib.suppress(Exception):
-                self.runner.close()
+                runner.close()
+
+    __del__ = close
 
 
-_THREAD_RUNNER = _ThreadRunner()
+_THREAD_LOCAL = threading.local()
+atexit.register(lambda: getattr(_THREAD_LOCAL, "runner", None) and _THREAD_LOCAL.runner.close())
 
 
 def _run(coro):
     if not hasattr(asyncio, "Runner"):  # Python 3.10
         return asyncio.run(coro)
-    if _THREAD_RUNNER.runner is None:
-        _THREAD_RUNNER.runner = asyncio.Runner()
-    runner = _THREAD_RUNNER.runner
+    holder = getattr(_THREAD_LOCAL, "runner", None)
+    if holder is None or holder.runner is None:
+        holder = _THREAD_LOCAL.runner = _Runner()
+    runner = holder.runner
     try:
         # the caller's context vars, as asyncio.run() would see them; Ctrl+C cancels the task
         return runner.run(coro, context=contextvars.copy_context())

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- On Windows, a script that made a sync call (`run()`, `tx.call()`) printed an asyncio
+  traceback ("Error on reading from the event loop self pipe") when the interpreter exited, and
+  each worker thread's event loop stayed open after the thread ended. The main thread's loop is
+  now closed at exit and a worker's when its thread ends.
+
 ## 0.10.3 - 2026-11-23
 
 ### Added
