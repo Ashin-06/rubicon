@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- `rubicon_openai_agents.function_tools(tx)` and `rubicon_pydantic_ai.tools(tx)`: a
+  `Transaction`'s tools as OpenAI Agents SDK `FunctionTool`s and PydanticAI `Tool`s, with the
+  new `openai-agents` and `pydantic-ai` extras and offline examples with scripted models.
+
 ## 0.11.0 - 2026-11-23
 
 ### Added
