@@ -6,6 +6,14 @@
 - `rubicon_openai_agents.function_tools(tx)` and `rubicon_pydantic_ai.tools(tx)`: a
   `Transaction`'s tools as OpenAI Agents SDK `FunctionTool`s and PydanticAI `Tool`s, with the
   new `openai-agents` and `pydantic-ai` extras and offline examples with scripted models.
+- A command line, `python -m rubicon` or `rubicon`: `inspect JOURNAL` lists unfinished
+  transactions and dead letters (`--json` too), `recover JOURNAL --module mytools` runs
+  `recover()` with your tools, and `ack JOURNAL TX [STEP]` acknowledges a dead letter. Works with
+  file, SQLite and PostgreSQL journals; standard library only.
+- `checkpoint(value)`: an undoable tool records how to undo what it has done so far, before it
+  finishes. If the step then fails, the rollback undoes it with that value, and after a crash
+  mid-step `recover()` undoes it instead of reporting it as uncertain. Journaled as a
+  `checkpoint` record; the crash fuzz covers a tool that checkpoints and then fails.
 
 ## 0.11.0 - 2026-11-23
 

@@ -41,6 +41,9 @@ pydantic-ai = ["pydantic-ai-slim>=1.0"]
 all = ["rubicon-agents[mcp,gemini,claude,openai,postgres,otel,langgraph,openai-agents,pydantic-ai]"]
 dev = ["pytest>=8", "pytest-cov>=5", "pytest-timeout>=2.3", "opentelemetry-sdk>=1.20"]
 
+[project.scripts]
+rubicon = "rubicon:main"
+
 [project.urls]
 Homepage = "https://github.com/Ashin-06/rubicon"
 Documentation = "https://github.com/Ashin-06/rubicon#readme"

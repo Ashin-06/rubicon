@@ -19,11 +19,11 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from rubicon import (  # noqa: E402
-    _LIVE, PlanFailed, Transaction, acknowledge, arun, compact, dead_letters, recover, run, tool)
+    _LIVE, checkpoint, PlanFailed, Transaction, acknowledge, arun, compact, dead_letters, recover, run, tool)
 
 COUNT = int(os.environ.get("RUBICON_FUZZ", "400"))
 SEED = int(os.environ.get("RUBICON_FUZZ_SEED", "0"))
-UNDOABLE = ["u0", "u1", "u2", "ua"]  # ua is async
+UNDOABLE = ["u0", "u1", "u2", "ua", "uc"]  # ua is async; uc checkpoints, then may still fail
 PERMANENT = ["p0", "p1", "pa"]  # pa is async
 
 
@@ -66,6 +66,20 @@ class World:
             self.items.add(key)
             self.ever.add(key)
             self.timeline.append(("u", key))
+            return {"key": key}
+
+        def apply_checkpointed(key):
+            """Has its effect, records a checkpoint, then may still fail: the effect must be undone."""
+            if self.dead:
+                raise Died()
+            if key in self.ever:
+                self.violations.append(f"{key} ran twice")
+            self.items.add(key)
+            self.ever.add(key)
+            self.timeline.append(("u", key))
+            checkpoint({"key": key})
+            if key in self.fail_tool:
+                raise Boom(f"{key} failed after its checkpoint")
             return {"key": key}
 
         def undo(result):
@@ -111,6 +125,7 @@ class World:
         for name in ("u0", "u1", "u2"):
             tool(lambda key: apply_u(key), name=name, undo=undo, undo_retries=0, registry=reg)
         tool(apply_u_async, name="ua", undo=undo, undo_retries=0, registry=reg)
+        tool(apply_checkpointed, name="uc", undo=undo, undo_retries=0, registry=reg)
         for name in ("p0", "p1"):
             tool(lambda key: apply_p(key), name=name, check=check, registry=reg)
         tool(apply_p_async, name="pa", check=check, registry=reg)

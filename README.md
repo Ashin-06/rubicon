@@ -577,7 +577,8 @@ How recovery decides:
 - If the crash happened while a permanent step was running, nobody knows whether it went
   through. `recover()` then undoes nothing that step may rely on: it reports the step in
   `needs_attention` and the steps it kept in `kept`, for a person to check. An undoable step that
-  started but never reported a result is listed in `uncertain`.
+  started but never reported a result is listed in `uncertain`, unless it recorded a checkpoint
+  (below).
 - Undos that failed earlier (a service was down) are retried on every run until they succeed.
 - Recovery journals each undo as it happens, so if recovery itself is interrupted, running it
   again never undoes anything twice.
@@ -595,6 +596,28 @@ process and machine runs the transaction, and `recover()` leaves alone any trans
 process is still alive on this machine, or that belongs to another machine (it can't check from
 here). Run `recover()` on each machine, or pass `include_live=True` when you know the other
 processes are gone.
+
+### Checkpoints: undo a step that never finished
+
+A step that creates something and then keeps working (places an order, then waits for its
+confirmation) can say how to undo it as soon as it has a handle:
+
+```python
+from rubicon import checkpoint
+
+@tool(undo=cancel_order)
+def place_order(item: str) -> str:
+    order_id = shop.create(item)       # the order exists from here on
+    checkpoint(order_id)               # journaled: undo with cancel_order(order_id)
+    shop.wait_until_confirmed(order_id)
+    return order_id
+```
+
+If the step then raises, the rollback calls `cancel_order(order_id)`; if the process dies before
+the step finishes, `recover()` does, instead of reporting the step as `uncertain`. A later
+checkpoint replaces an earlier one, and a step that finishes is undone with its result as usual.
+Only undoable steps can checkpoint. The undo must cope with whatever the step had done by then,
+so make it idempotent.
 
 ### Where the journal lives
 
@@ -651,6 +674,22 @@ acknowledge(journal, letter["tx"], note="the payment went through")
   the crash report.
 - `acknowledge()` raises `ValueError` for a transaction or step the journal doesn't contain, so
   a typo can't leave the real dead letter open.
+
+### From the command line
+
+`python -m rubicon` (also installed as `rubicon`) works on any journal: a `.jsonl` path, a
+`.db`/`.sqlite` path, or a `postgresql://` URL.
+
+```bash
+rubicon inspect rubicon.jsonl                  # unfinished transactions and dead letters (--json too)
+rubicon recover rubicon.jsonl --module mytools # import your tools, then run recover()
+rubicon recover rubicon.db --module mytools:REGISTRY   # tools in a registry dict, not rubicon.TOOLS
+rubicon ack rubicon.jsonl TX_ID [STEP] --note "refunded by hand"
+```
+
+`inspect` shows, for each unfinished transaction, whether its process may still be running, the
+step in progress, the undoable steps since its last commit, undos still owed, and what
+committed. `recover` prints the reports as JSON and logs to stderr. Errors exit with status 1.
 
 ### Keeping the journal small
 
@@ -770,6 +809,7 @@ python demo.py claude --yes    # approve the permanent steps unattended (APPROVE
 | `BudgetExceeded` | Raised when `max_calls` or `max_seconds` is used up, after rolling back. |
 | `Transaction(registry=None, confirm=None, log=None, *, on_event=None, journal=None, max_calls=None, max_seconds=None)` | Guard an agent loop. Methods: `call`/`acall`, `commit`/`acommit`, `rollback`/`arollback`, `wrap(name)`, `wrap_all()` (a list). Attributes: `id`, `results`, `committed`, `undone`, `undo_failed`. A sync or async context manager. |
 | `PlanFailed` | Raised after rollback. Attributes: `step`, `cause`, `undone`, `committed`, `not_run`, `undo_failed`, `results`. |
+| `checkpoint(value)` | Inside an undoable tool: from now on, undo this step with `value` even if it never finishes. |
 | `recover(journal, registry=None, log=None, *, on_dead_letter=None, include_live=False)`, `arecover(...)` | Undo what crashes left unfinished, leaving running transactions alone. Returns one report per transaction it worked on. |
 | `dead_letters(journal)` | Steps that need a person, oldest first. |
 | `acknowledge(journal, tx, step=None, note="")` | Mark a dead letter, or a whole transaction, as handled. |
@@ -893,6 +933,8 @@ pytest tests/test_confirm.py   # one area: the fail-closed confirmation gate
 | `tests/test_otel.py` | OpenTelemetry spans, checked with the in-memory exporter |
 | `tests/test_langgraph.py` | the LangGraph guard: interrupt, approve, decline, errors, async graphs, the example |
 | `tests/test_agent_adapters.py` | the OpenAI Agents SDK and PydanticAI adapters and their examples |
+| `tests/test_cli.py` | `python -m rubicon inspect`, `recover` and `ack` against a real crash |
+| `tests/test_checkpoint.py` | mid-step checkpoints: failures and crashes after a checkpoint are undone |
 | `tests/test_mcp.py` | MCP adapter against an in-memory MCP server |
 | `tests/test_llm.py` | planners and `agent()` with stub clients |
 | `tests/test_failure_injection.py` | end state after rollback and recovery under real injected HTTP and SQLite failures |

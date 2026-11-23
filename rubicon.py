@@ -50,7 +50,7 @@ from graphlib import CycleError, TopologicalSorter
 from typing import Callable
 
 __all__ = ["APPROVE_ALL", "BudgetExceeded", "adry_run", "dry_run", "FileJournal", "JournalBusy", "NOOP", "PlanFailed", "PostgresJournal",
-           "SQLiteJournal", "TOOLS", "Tool", "Transaction", "UNSET", "acknowledge", "arecover", "arun", "compact", "dead_letters", "order",
+           "SQLiteJournal", "TOOLS", "Tool", "Transaction", "UNSET", "acknowledge", "arecover", "arun", "checkpoint", "compact", "dead_letters", "order",
            "recover", "run", "tool", "tools_for_llm"]
 
 _logger = logging.getLogger("rubicon")
@@ -391,6 +391,23 @@ async def _call(fn, *args, **kwargs):
 
 
 _DRIVING = contextvars.ContextVar("rubicon_driving", default=False)
+_CHECKPOINT = contextvars.ContextVar("rubicon_checkpoint", default=None)
+
+
+def checkpoint(value):
+    """Record, from inside an undoable tool, how to undo what it has done so far.
+
+    Call it as soon as the step has a handle its undo can use (an order id, a hold), before the
+    rest of the step runs. If the step then fails, or the process dies before it finishes, the
+    step is undone with undo(value) instead of being left uncertain. A later checkpoint replaces
+    an earlier one, and a step that finishes is undone with its result as usual. The undo must
+    cope with whatever the step had done by then, so make it idempotent.
+    """
+    record = _CHECKPOINT.get()
+    if record is None:
+        raise RuntimeError("checkpoint() can only be called while an undoable Rubicon step runs")
+    record(value)
+
 
 _HOST = socket.gethostname()
 _LIVE: set = set()  # ids of journaled transactions in this process that have steps not yet settled
@@ -792,16 +809,27 @@ class Transaction:
             raise
         self._emit("step_started", step=label, tool=name, permanent=permanent)
         rollbacks, start = self._rollbacks, time.perf_counter()
+        saved = []  # the latest checkpoint(value) of this step
+
+        def record(value):
+            self._write("checkpoint", step=label, tool=name, args=_jsonable(view), result=_jsonable(value))
+            saved[:] = [value]
+
+        token = _CHECKPOINT.set(None if permanent else record)
         try:
             r = await _attempt(t.fn, a, k, t.retries, t.timeout)
         except BaseException as e:
             self._running.discard(label)
+            if saved:  # part of the step happened: roll it back like a finished step
+                self.done.append({"id": label, "tool": name, "args": view, "result": saved[0]})
             try:
                 self._write("step_failed", step=label, tool=name, error=repr(e))
             except Exception as journal_error:  # the step's own error is what the caller must see
                 _complain(f"could not journal the failure of {label}: {journal_error!r}")
             self._emit("step_failed", step=label, tool=name, error=repr(e))
             raise
+        finally:
+            _CHECKPOINT.reset(token)
         self._running.discard(label)
         ms = round((time.perf_counter() - start) * 1000, 1)
         self.results[label] = r
@@ -1456,7 +1484,7 @@ def _replay(records):
             tx["begin"] = rec
         if event == "started":
             tx["open"][step] = rec
-        elif event == "done":
+        elif event in ("done", "checkpoint"):  # a checkpoint can be undone like a finished step
             tx["open"].pop(step, None)
             tx["done"][step] = rec
         elif event == "committed":
@@ -1760,3 +1788,104 @@ def compact(journal) -> int:
             else:
                 j.drop(settled)  # a custom journal: see the README on concurrent compaction
         return len(settled)
+
+
+# ---------------------------------------------------------------------------- command line
+
+def _open_journal(spec):
+    if spec.startswith(("postgres://", "postgresql://")):
+        return PostgresJournal(spec)
+    if spec.endswith((".db", ".sqlite", ".sqlite3")):
+        return SQLiteJournal(spec)
+    return FileJournal(spec)
+
+
+def main(argv=None):
+    """`python -m rubicon` (or `rubicon`): inspect a journal, run recover(), acknowledge a dead letter.
+
+        rubicon inspect JOURNAL [--json]
+        rubicon recover JOURNAL --module mytools [--module other:REGISTRY] [--include-live]
+        rubicon ack JOURNAL TX [STEP] [--note TEXT]
+
+    JOURNAL is a .jsonl path (FileJournal), a .db/.sqlite path (SQLiteJournal) or a
+    postgresql:// URL (PostgresJournal).
+    """
+    import argparse
+    import importlib
+    import sys
+
+    import rubicon as core  # the module tool modules register into, even under `python -m rubicon`
+
+    parser = argparse.ArgumentParser(prog="rubicon", description="Inspect and repair a Rubicon journal.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("inspect", help="list unfinished transactions and dead letters")
+    p.add_argument("journal")
+    p.add_argument("--json", action="store_true", help="print JSON instead of text")
+    p = sub.add_parser("recover", help="run recover() with the tools from your modules")
+    p.add_argument("journal")
+    p.add_argument("--module", action="append", default=[], metavar="MODULE[:REGISTRY]",
+                   help="import MODULE so its @tool functions register; with :REGISTRY, use that dict "
+                        "attribute as the registry instead of rubicon.TOOLS (repeatable)")
+    p.add_argument("--include-live", action="store_true",
+                   help="also recover transactions whose process looks alive (only when you know it is gone)")
+    p = sub.add_parser("ack", help="acknowledge a dead letter after a person handled it")
+    p.add_argument("journal")
+    p.add_argument("tx")
+    p.add_argument("step", nargs="?")
+    p.add_argument("--note", default="")
+    args = parser.parse_args(argv)
+    out = sys.stdout
+
+    try:
+        journal = core._open_journal(args.journal)
+        if args.command == "inspect":
+            txs, _ = core._replay(journal.records())
+            unfinished = []
+            for tx in txs.values():
+                if tx["finished"] and not tx["owed"]:
+                    continue
+                begin = tx["begin"] or {}
+                unfinished.append({
+                    "tx": tx["id"], "maybe_running": core._maybe_running(tx),
+                    "pid": begin.get("pid"), "host": begin.get("host"),
+                    "in_progress": list(tx["open"]), "undoable": list(tx["done"]),
+                    "owed": list(tx["owed"]), "committed": tx["committed"]})
+            letters = core.dead_letters(journal)
+            if args.json:
+                json.dump({"unfinished": unfinished, "dead_letters": letters}, out, indent=1, default=str)
+                out.write("\n")
+                return 0
+            out.write(f"{len(unfinished)} unfinished transaction(s)\n")
+            for t in unfinished:
+                state = "may be running" if t["maybe_running"] else "not running"
+                out.write(f"  {t['tx']}  {state}  (pid {t['pid']} on {t['host']})\n")
+                for label in ("in_progress", "undoable", "owed", "committed"):
+                    if t[label]:
+                        out.write(f"    {label.replace('_', ' ')}: {', '.join(map(str, t[label]))}\n")
+            out.write(f"{len(letters)} dead letter(s)\n")
+            for d in letters:
+                out.write(f"  {d['tx']}  {d['step']}  {d['kind']}: {d.get('reason') or ''}\n")
+            return 0
+        if args.command == "recover":
+            sys.path.insert(0, os.getcwd())  # so a tools module next to the journal imports
+            registry = None
+            for spec in args.module:
+                name, _, attr = spec.partition(":")
+                module = importlib.import_module(name)
+                if attr:
+                    registry = {**(registry or {}), **getattr(module, attr)}
+            reports = core.recover(journal, registry=registry, include_live=args.include_live,
+                                   log=lambda m: print(m, file=sys.stderr))
+            json.dump(reports, out, indent=1, default=str)
+            out.write("\n")
+            return 0
+        core.acknowledge(journal, args.tx, args.step, note=args.note)
+        out.write(f"acknowledged {args.tx}{' ' + args.step if args.step else ''}\n")
+        return 0
+    except (ValueError, LookupError, OSError, ImportError, core.JournalBusy) as e:
+        print(f"rubicon: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
