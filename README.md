@@ -8,6 +8,9 @@
 checks what can't, asks once, and only then crosses the point of no return. If anything fails,
 is refused or is interrupted before that point, every step that already ran is undone.
 
+![Rubicon rolling back an MCP agent after a mid-plan failure, then committing after approval](https://raw.githubusercontent.com/Ashin-06/rubicon/main/docs/demo.gif)
+
+
 ```
 plan from the model           what Rubicon runs
 -------------------           ------------------------------------------------
