@@ -3,6 +3,9 @@
 ## Unreleased
 
 ### Added
+- `rubicon_openai_agents.function_tools(tx)` and `rubicon_pydantic_ai.tools(tx)`: a
+  `Transaction`'s tools as OpenAI Agents SDK `FunctionTool`s and PydanticAI `Tool`s, with the
+  new `openai-agents` and `pydantic-ai` extras and offline examples with scripted models.
 - A command line, `python -m rubicon` or `rubicon`: `inspect JOURNAL` lists unfinished
   transactions and dead letters (`--json` too), `recover JOURNAL --module mytools` runs
   `recover()` with your tools, and `ack JOURNAL TX [STEP]` acknowledges a dead letter. Works with

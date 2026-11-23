@@ -48,6 +48,7 @@ The core is one file with no dependencies beyond the Python standard library.
 - [Tools: undo, checks, previews, retries](#tools-undo-checks-previews-retries)
 - [MCP servers](#mcp-servers)
 - [LangGraph](#langgraph)
+- [OpenAI Agents SDK and PydanticAI](#openai-agents-sdk-and-pydanticai)
 - [Let a model write the plan](#let-a-model-write-the-plan)
 - [Crash safety: journals and recovery](#crash-safety-journals-and-recovery)
 - [Events, logging and parallel steps](#events-logging-and-parallel-steps)
@@ -135,6 +136,8 @@ The package is called `rubicon-agents`; you import it as `rubicon` (plus `rubico
 | `postgres` | `psycopg` 3 | `PostgresJournal` |
 | `otel` | `opentelemetry-api` | `rubicon_otel.tracing()` |
 | `langgraph` | `langgraph` | `rubicon_langgraph.Guard` |
+| `openai-agents` | `openai-agents` | `rubicon_openai_agents.function_tools` |
+| `pydantic-ai` | `pydantic-ai-slim` | `rubicon_pydantic_ai.tools` |
 | `all` | all of the above | |
 | `dev` | `pytest`, `pytest-cov`, `pytest-timeout`, `opentelemetry-sdk` | running the tests |
 
@@ -468,6 +471,32 @@ resolved arguments and check preview. Any resume value other than `True` rolls b
 `Transaction` lives in the process that runs the graph, so resume there.
 [`examples/langgraph_agent.py`](https://github.com/Ashin-06/rubicon/blob/main/examples/langgraph_agent.py)
 runs offline with a stub model: `python examples/langgraph_agent.py` (or `--no` to decline).
+
+## OpenAI Agents SDK and PydanticAI
+
+Both take a `Transaction`'s tools as their own tool objects. The transaction is the guard: wrap
+the agent run in it, and it commits (after one confirmation) on a clean exit and rolls back on an
+exception.
+
+```python
+from rubicon import Transaction
+from rubicon_openai_agents import function_tools       # OpenAI Agents SDK: FunctionTool
+from rubicon_pydantic_ai import tools                    # PydanticAI: Tool
+
+async with Transaction(registry, confirm=ask_human) as tx:
+    agent = Agent(name="travel", instructions="...", tools=function_tools(tx))
+    await Runner.run(agent, "Move OLD1 to AI101")
+
+async with Transaction(registry, confirm=ask_human) as tx:
+    await pydantic_ai.Agent("openai:gpt-5.1", tools=tools(tx)).run("Move OLD1 to AI101")
+```
+
+Undoable tools run at once; permanent ones are checked and scheduled, and the model is told so.
+Errors follow each SDK's habit: the OpenAI Agents SDK gets the error as text so the agent can
+react, while PydanticAI ends the run (raise `ModelRetry` in a tool to let the model retry), and
+the block rolls back. [`examples/openai_agents_agent.py`](https://github.com/Ashin-06/rubicon/blob/main/examples/openai_agents_agent.py)
+and [`examples/pydantic_ai_agent.py`](https://github.com/Ashin-06/rubicon/blob/main/examples/pydantic_ai_agent.py)
+run offline with scripted models (`--no` to decline).
 
 ## Let a model write the plan
 
@@ -903,6 +932,7 @@ pytest tests/test_confirm.py   # one area: the fail-closed confirmation gate
 | `tests/test_sync_loop.py` | sync calls reuse one event loop per thread, stay fast and still unwind on Ctrl+C |
 | `tests/test_otel.py` | OpenTelemetry spans, checked with the in-memory exporter |
 | `tests/test_langgraph.py` | the LangGraph guard: interrupt, approve, decline, errors, async graphs, the example |
+| `tests/test_agent_adapters.py` | the OpenAI Agents SDK and PydanticAI adapters and their examples |
 | `tests/test_cli.py` | `python -m rubicon inspect`, `recover` and `ack` against a real crash |
 | `tests/test_checkpoint.py` | mid-step checkpoints: failures and crashes after a checkpoint are undone |
 | `tests/test_mcp.py` | MCP adapter against an in-memory MCP server |
