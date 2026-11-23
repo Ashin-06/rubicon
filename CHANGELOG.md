@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.5 - 2026-11-23
+
+### Documentation
+- The README opens with a short recording of the MCP agent demo (a failure rolled back, then an
+  approved send), now also on the PyPI page. No code changes.
+
 ## 0.10.4 - 2026-11-23
 
 ### Fixed
