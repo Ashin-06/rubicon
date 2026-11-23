@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- `checkpoint(value)`: an undoable tool records how to undo what it has done so far, before it
+  finishes. If the step then fails, the rollback undoes it with that value, and after a crash
+  mid-step `recover()` undoes it instead of reporting it as uncertain. Journaled as a
+  `checkpoint` record; the crash fuzz covers a tool that checkpoints and then fails.
+
 ## 0.11.0 - 2026-11-23
 
 ### Added
