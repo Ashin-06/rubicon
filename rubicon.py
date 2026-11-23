@@ -50,7 +50,7 @@ from graphlib import CycleError, TopologicalSorter
 from typing import Callable
 
 __all__ = ["APPROVE_ALL", "BudgetExceeded", "adry_run", "dry_run", "FileJournal", "JournalBusy", "NOOP", "PlanFailed", "PostgresJournal",
-           "SQLiteJournal", "TOOLS", "Tool", "Transaction", "UNSET", "acknowledge", "arecover", "arun", "compact", "dead_letters", "order",
+           "SQLiteJournal", "TOOLS", "Tool", "Transaction", "UNSET", "acknowledge", "arecover", "arun", "checkpoint", "compact", "dead_letters", "order",
            "recover", "run", "tool", "tools_for_llm"]
 
 _logger = logging.getLogger("rubicon")
@@ -391,6 +391,23 @@ async def _call(fn, *args, **kwargs):
 
 
 _DRIVING = contextvars.ContextVar("rubicon_driving", default=False)
+_CHECKPOINT = contextvars.ContextVar("rubicon_checkpoint", default=None)
+
+
+def checkpoint(value):
+    """Record, from inside an undoable tool, how to undo what it has done so far.
+
+    Call it as soon as the step has a handle its undo can use (an order id, a hold), before the
+    rest of the step runs. If the step then fails, or the process dies before it finishes, the
+    step is undone with undo(value) instead of being left uncertain. A later checkpoint replaces
+    an earlier one, and a step that finishes is undone with its result as usual. The undo must
+    cope with whatever the step had done by then, so make it idempotent.
+    """
+    record = _CHECKPOINT.get()
+    if record is None:
+        raise RuntimeError("checkpoint() can only be called while an undoable Rubicon step runs")
+    record(value)
+
 
 _HOST = socket.gethostname()
 _LIVE: set = set()  # ids of journaled transactions in this process that have steps not yet settled
@@ -792,16 +809,27 @@ class Transaction:
             raise
         self._emit("step_started", step=label, tool=name, permanent=permanent)
         rollbacks, start = self._rollbacks, time.perf_counter()
+        saved = []  # the latest checkpoint(value) of this step
+
+        def record(value):
+            self._write("checkpoint", step=label, tool=name, args=_jsonable(view), result=_jsonable(value))
+            saved[:] = [value]
+
+        token = _CHECKPOINT.set(None if permanent else record)
         try:
             r = await _attempt(t.fn, a, k, t.retries, t.timeout)
         except BaseException as e:
             self._running.discard(label)
+            if saved:  # part of the step happened: roll it back like a finished step
+                self.done.append({"id": label, "tool": name, "args": view, "result": saved[0]})
             try:
                 self._write("step_failed", step=label, tool=name, error=repr(e))
             except Exception as journal_error:  # the step's own error is what the caller must see
                 _complain(f"could not journal the failure of {label}: {journal_error!r}")
             self._emit("step_failed", step=label, tool=name, error=repr(e))
             raise
+        finally:
+            _CHECKPOINT.reset(token)
         self._running.discard(label)
         ms = round((time.perf_counter() - start) * 1000, 1)
         self.results[label] = r
@@ -1456,7 +1484,7 @@ def _replay(records):
             tx["begin"] = rec
         if event == "started":
             tx["open"][step] = rec
-        elif event == "done":
+        elif event in ("done", "checkpoint"):  # a checkpoint can be undone like a finished step
             tx["open"].pop(step, None)
             tx["done"][step] = rec
         elif event == "committed":
