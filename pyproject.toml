@@ -39,6 +39,9 @@ langgraph = ["langgraph>=0.4", "langchain-core>=0.3"]
 all = ["rubicon-agents[mcp,gemini,claude,openai,postgres,otel,langgraph]"]
 dev = ["pytest>=8", "pytest-cov>=5", "pytest-timeout>=2.3", "opentelemetry-sdk>=1.20"]
 
+[project.scripts]
+rubicon = "rubicon:main"
+
 [project.urls]
 Homepage = "https://github.com/Ashin-06/rubicon"
 Documentation = "https://github.com/Ashin-06/rubicon#readme"

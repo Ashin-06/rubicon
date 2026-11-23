@@ -3,6 +3,10 @@
 ## Unreleased
 
 ### Added
+- A command line, `python -m rubicon` or `rubicon`: `inspect JOURNAL` lists unfinished
+  transactions and dead letters (`--json` too), `recover JOURNAL --module mytools` runs
+  `recover()` with your tools, and `ack JOURNAL TX [STEP]` acknowledges a dead letter. Works with
+  file, SQLite and PostgreSQL journals; standard library only.
 - `checkpoint(value)`: an undoable tool records how to undo what it has done so far, before it
   finishes. If the step then fails, the rollback undoes it with that value, and after a crash
   mid-step `recover()` undoes it instead of reporting it as uncertain. Journaled as a

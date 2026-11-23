@@ -1788,3 +1788,104 @@ def compact(journal) -> int:
             else:
                 j.drop(settled)  # a custom journal: see the README on concurrent compaction
         return len(settled)
+
+
+# ---------------------------------------------------------------------------- command line
+
+def _open_journal(spec):
+    if spec.startswith(("postgres://", "postgresql://")):
+        return PostgresJournal(spec)
+    if spec.endswith((".db", ".sqlite", ".sqlite3")):
+        return SQLiteJournal(spec)
+    return FileJournal(spec)
+
+
+def main(argv=None):
+    """`python -m rubicon` (or `rubicon`): inspect a journal, run recover(), acknowledge a dead letter.
+
+        rubicon inspect JOURNAL [--json]
+        rubicon recover JOURNAL --module mytools [--module other:REGISTRY] [--include-live]
+        rubicon ack JOURNAL TX [STEP] [--note TEXT]
+
+    JOURNAL is a .jsonl path (FileJournal), a .db/.sqlite path (SQLiteJournal) or a
+    postgresql:// URL (PostgresJournal).
+    """
+    import argparse
+    import importlib
+    import sys
+
+    import rubicon as core  # the module tool modules register into, even under `python -m rubicon`
+
+    parser = argparse.ArgumentParser(prog="rubicon", description="Inspect and repair a Rubicon journal.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("inspect", help="list unfinished transactions and dead letters")
+    p.add_argument("journal")
+    p.add_argument("--json", action="store_true", help="print JSON instead of text")
+    p = sub.add_parser("recover", help="run recover() with the tools from your modules")
+    p.add_argument("journal")
+    p.add_argument("--module", action="append", default=[], metavar="MODULE[:REGISTRY]",
+                   help="import MODULE so its @tool functions register; with :REGISTRY, use that dict "
+                        "attribute as the registry instead of rubicon.TOOLS (repeatable)")
+    p.add_argument("--include-live", action="store_true",
+                   help="also recover transactions whose process looks alive (only when you know it is gone)")
+    p = sub.add_parser("ack", help="acknowledge a dead letter after a person handled it")
+    p.add_argument("journal")
+    p.add_argument("tx")
+    p.add_argument("step", nargs="?")
+    p.add_argument("--note", default="")
+    args = parser.parse_args(argv)
+    out = sys.stdout
+
+    try:
+        journal = core._open_journal(args.journal)
+        if args.command == "inspect":
+            txs, _ = core._replay(journal.records())
+            unfinished = []
+            for tx in txs.values():
+                if tx["finished"] and not tx["owed"]:
+                    continue
+                begin = tx["begin"] or {}
+                unfinished.append({
+                    "tx": tx["id"], "maybe_running": core._maybe_running(tx),
+                    "pid": begin.get("pid"), "host": begin.get("host"),
+                    "in_progress": list(tx["open"]), "undoable": list(tx["done"]),
+                    "owed": list(tx["owed"]), "committed": tx["committed"]})
+            letters = core.dead_letters(journal)
+            if args.json:
+                json.dump({"unfinished": unfinished, "dead_letters": letters}, out, indent=1, default=str)
+                out.write("\n")
+                return 0
+            out.write(f"{len(unfinished)} unfinished transaction(s)\n")
+            for t in unfinished:
+                state = "may be running" if t["maybe_running"] else "not running"
+                out.write(f"  {t['tx']}  {state}  (pid {t['pid']} on {t['host']})\n")
+                for label in ("in_progress", "undoable", "owed", "committed"):
+                    if t[label]:
+                        out.write(f"    {label.replace('_', ' ')}: {', '.join(map(str, t[label]))}\n")
+            out.write(f"{len(letters)} dead letter(s)\n")
+            for d in letters:
+                out.write(f"  {d['tx']}  {d['step']}  {d['kind']}: {d.get('reason') or ''}\n")
+            return 0
+        if args.command == "recover":
+            sys.path.insert(0, os.getcwd())  # so a tools module next to the journal imports
+            registry = None
+            for spec in args.module:
+                name, _, attr = spec.partition(":")
+                module = importlib.import_module(name)
+                if attr:
+                    registry = {**(registry or {}), **getattr(module, attr)}
+            reports = core.recover(journal, registry=registry, include_live=args.include_live,
+                                   log=lambda m: print(m, file=sys.stderr))
+            json.dump(reports, out, indent=1, default=str)
+            out.write("\n")
+            return 0
+        core.acknowledge(journal, args.tx, args.step, note=args.note)
+        out.write(f"acknowledged {args.tx}{' ' + args.step if args.step else ''}\n")
+        return 0
+    except (ValueError, LookupError, OSError, ImportError, core.JournalBusy) as e:
+        print(f"rubicon: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

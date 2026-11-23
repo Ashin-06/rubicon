@@ -646,6 +646,22 @@ acknowledge(journal, letter["tx"], note="the payment went through")
 - `acknowledge()` raises `ValueError` for a transaction or step the journal doesn't contain, so
   a typo can't leave the real dead letter open.
 
+### From the command line
+
+`python -m rubicon` (also installed as `rubicon`) works on any journal: a `.jsonl` path, a
+`.db`/`.sqlite` path, or a `postgresql://` URL.
+
+```bash
+rubicon inspect rubicon.jsonl                  # unfinished transactions and dead letters (--json too)
+rubicon recover rubicon.jsonl --module mytools # import your tools, then run recover()
+rubicon recover rubicon.db --module mytools:REGISTRY   # tools in a registry dict, not rubicon.TOOLS
+rubicon ack rubicon.jsonl TX_ID [STEP] --note "refunded by hand"
+```
+
+`inspect` shows, for each unfinished transaction, whether its process may still be running, the
+step in progress, the undoable steps since its last commit, undos still owed, and what
+committed. `recover` prints the reports as JSON and logs to stderr. Errors exit with status 1.
+
 ### Keeping the journal small
 
 `compact(journal)` removes settled transactions and keeps everything that is unfinished, owes an
@@ -887,6 +903,7 @@ pytest tests/test_confirm.py   # one area: the fail-closed confirmation gate
 | `tests/test_sync_loop.py` | sync calls reuse one event loop per thread, stay fast and still unwind on Ctrl+C |
 | `tests/test_otel.py` | OpenTelemetry spans, checked with the in-memory exporter |
 | `tests/test_langgraph.py` | the LangGraph guard: interrupt, approve, decline, errors, async graphs, the example |
+| `tests/test_cli.py` | `python -m rubicon inspect`, `recover` and `ack` against a real crash |
 | `tests/test_checkpoint.py` | mid-step checkpoints: failures and crashes after a checkpoint are undone |
 | `tests/test_mcp.py` | MCP adapter against an in-memory MCP server |
 | `tests/test_llm.py` | planners and `agent()` with stub clients |
