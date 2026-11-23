@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- A command line, `python -m rubicon` or `rubicon`: `inspect JOURNAL` lists unfinished
+  transactions and dead letters (`--json` too), `recover JOURNAL --module mytools` runs
+  `recover()` with your tools, and `ack JOURNAL TX [STEP]` acknowledges a dead letter. Works with
+  file, SQLite and PostgreSQL journals; standard library only.
+
 ## 0.11.0 - 2026-11-23
 
 ### Added
