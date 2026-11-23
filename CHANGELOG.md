@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.12.0 - 2026-11-23
 
 ### Added
 - `rubicon_openai_agents.function_tools(tx)` and `rubicon_pydantic_ai.tools(tx)`: a
