@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.11.0 - 2026-11-23
+
+### Added
+- `dry_run(plan, registry)` / `adry_run`: what `run()` would do with nothing executed. It returns the
+  order, which steps are undoable or permanent, the point of no return, and the result of each permanent
+  step's check whose inputs are known now (`would_fail` lists those that already fail).
+- Budgets: `max_calls` and `max_seconds` on `run()`, `arun()` and `Transaction`. Going over raises
+  `BudgetExceeded` after rolling back. `run()` rejects a plan with more steps than `max_calls` before
+  anything runs, and `max_seconds` is never enforced during a commit.
+
 ## 0.10.5 - 2026-11-23
 
 ### Documentation
