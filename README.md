@@ -43,6 +43,7 @@ The core is one file with no dependencies beyond the Python standard library.
 - [Words used here](#words-used-here)
 - [What happens when something fails](#what-happens-when-something-fails)
 - [Two ways to use it](#two-ways-to-use-it)
+- [Preview a plan, and budgets](#preview-a-plan-and-budgets)
 - [Plan format](#plan-format)
 - [Tools: undo, checks, previews, retries](#tools-undo-checks-previews-retries)
 - [MCP servers](#mcp-servers)
@@ -289,6 +290,35 @@ with Transaction(confirm=ask_human) as tx:
 
 > A permanent tool's real result only exists after commit. Design the agent so it doesn't need
 > that result to choose its next step, or commit in stages.
+
+## Preview a plan, and budgets
+
+`dry_run(plan, registry)` shows what `run()` would do without running anything: the order, which steps
+are undoable or permanent, where the point of no return is, and the result of each permanent step's
+check whose inputs are already known (checks are dry runs by contract). An invalid plan raises
+`ValueError`, exactly as `run()` would before starting.
+
+```python
+from rubicon import dry_run
+
+report = dry_run(plan, registry)
+report["point_of_no_return"]   # "pay"
+report["steps"][1]["check"]    # {"preview": "charge 300"}, {"error": "..."} or {"waits_for": ["hold"]}
+report["would_fail"]           # ids of permanent steps whose check already fails
+```
+
+Budgets stop a looping agent before it does too much. Going over one rolls back, like any failure:
+
+```python
+tx = Transaction(registry, confirm=ask_human, max_calls=20, max_seconds=120)
+run(plan, registry, confirm=ask_human, max_calls=20, max_seconds=120)
+```
+
+- `max_calls` counts tool calls (undoable ones and scheduled permanent ones). `run()` rejects a longer
+  plan before anything runs; a `Transaction` raises `BudgetExceeded` on the call that goes over, after
+  rolling back.
+- `max_seconds` is measured from the start of the transaction. It is checked before each undoable step
+  and before the point of no return, never during a commit: once permanent steps start, they finish.
 
 ## Plan format
 
@@ -704,10 +734,12 @@ python demo.py claude --yes    # approve the permanent steps unattended (APPROVE
 | `tool(fn=None, *, undo=None, check=None, name=None, registry=None, retries=0, undo_retries=2, timeout=None)` | Register a tool. See [Tools](#tools-undo-checks-previews-retries). |
 | `NOOP` | Undo function for read-only tools. |
 | `UNSET` | Default for optional parameters that should be left out of the call entirely. |
-| `run(plan, registry=None, confirm=None, log=None, *, parallel=False, on_event=None, journal=None)`, `arun(...)` | Run a plan and return `{step_id: result}`. Without `confirm`, permanent steps are refused. |
+| `run(plan, registry=None, confirm=None, log=None, *, parallel=False, on_event=None, journal=None, max_calls=None, max_seconds=None)`, `arun(...)` | Run a plan and return `{step_id: result}`. Without `confirm`, permanent steps are refused. |
 | `APPROVE_ALL` | `confirm=APPROVE_ALL` approves permanent steps with nobody asked, for unattended runs. |
 | `order(plan, registry=None)` | Validate a plan and return the order it would run in. Raises `ValueError`. |
-| `Transaction(registry=None, confirm=None, log=None, *, on_event=None, journal=None)` | Guard an agent loop. Methods: `call`/`acall`, `commit`/`acommit`, `rollback`/`arollback`, `wrap(name)`, `wrap_all()` (a list). Attributes: `id`, `results`, `committed`, `undone`, `undo_failed`. A sync or async context manager. |
+| `dry_run(plan, registry=None)`, `adry_run(...)` | What `run()` would do, with nothing executed: order, point of no return, and the known permanent checks. |
+| `BudgetExceeded` | Raised when `max_calls` or `max_seconds` is used up, after rolling back. |
+| `Transaction(registry=None, confirm=None, log=None, *, on_event=None, journal=None, max_calls=None, max_seconds=None)` | Guard an agent loop. Methods: `call`/`acall`, `commit`/`acommit`, `rollback`/`arollback`, `wrap(name)`, `wrap_all()` (a list). Attributes: `id`, `results`, `committed`, `undone`, `undo_failed`. A sync or async context manager. |
 | `PlanFailed` | Raised after rollback. Attributes: `step`, `cause`, `undone`, `committed`, `not_run`, `undo_failed`, `results`. |
 | `recover(journal, registry=None, log=None, *, on_dead_letter=None, include_live=False)`, `arecover(...)` | Undo what crashes left unfinished, leaving running transactions alone. Returns one report per transaction it worked on. |
 | `dead_letters(journal)` | Steps that need a person, oldest first. |
@@ -801,7 +833,7 @@ To report a vulnerability, see [SECURITY.md](https://github.com/Ashin-06/rubicon
 
 ## Testing
 
-The suite has 239 pytest tests with 91% line coverage, grouped by feature under
+The suite has 244 pytest tests with 91% line coverage, grouped by feature under
 `tests/`. No API keys or network are needed. The PostgreSQL tests are skipped unless
 `RUBICON_PG_DSN` points at a database (`RUBICON_FUZZ_PG` sets their fuzz count, default 100).
 Rollback correctness under injected failures:

@@ -49,7 +49,7 @@ from dataclasses import dataclass
 from graphlib import CycleError, TopologicalSorter
 from typing import Callable
 
-__all__ = ["APPROVE_ALL", "FileJournal", "JournalBusy", "NOOP", "PlanFailed", "PostgresJournal",
+__all__ = ["APPROVE_ALL", "BudgetExceeded", "adry_run", "dry_run", "FileJournal", "JournalBusy", "NOOP", "PlanFailed", "PostgresJournal",
            "SQLiteJournal", "TOOLS", "Tool", "Transaction", "UNSET", "acknowledge", "arecover", "arun", "compact", "dead_letters", "order",
            "recover", "run", "tool", "tools_for_llm"]
 
@@ -201,6 +201,10 @@ class PlanFailed(Exception):
         if undo_failed:
             msg += f"; UNDO FAILED for {undo_failed}"
         super().__init__(msg)
+
+
+class BudgetExceeded(RuntimeError):
+    """A transaction made more tool calls, or ran longer, than its max_calls / max_seconds allow."""
 
 
 class _StepFailed(Exception):
@@ -684,8 +688,12 @@ class Transaction:
     recover() can use to undo an interrupted transaction after a restart.
     """
 
-    def __init__(self, registry=None, confirm=None, log=None, *, on_event=None, journal=None):
+    def __init__(self, registry=None, confirm=None, log=None, *, on_event=None, journal=None,
+                 max_calls=None, max_seconds=None):
         self.tools = TOOLS if registry is None else registry
+        # budgets for a looping agent: going over rolls back (calls count undoable and scheduled ones)
+        self.max_calls, self.max_seconds = max_calls, max_seconds
+        self._calls, self._started = 0, time.monotonic()
         self.confirm, self.log, self.on_event = confirm, log or _logger.info, on_event
         self.id = uuid.uuid4().hex
         self.done = []  # undoable calls since the last commit, in completion order
@@ -698,6 +706,17 @@ class Transaction:
         self._rollbacks = 0  # a step that finishes after a rollback started undoes itself
 
     # -- bookkeeping
+
+    def _over_time(self):
+        return self.max_seconds is not None and time.monotonic() - self._started > self.max_seconds
+
+    def _spend(self):
+        """Count one tool call against the budget; raise BudgetExceeded when it is used up."""
+        self._calls += 1
+        if self.max_calls is not None and self._calls > self.max_calls:
+            raise BudgetExceeded(f"more than {self.max_calls} tool calls in one transaction")
+        if self._over_time():
+            raise BudgetExceeded(f"transaction ran longer than {self.max_seconds} seconds")
 
     def _emit(self, event, **data):
         if self.on_event:
@@ -826,6 +845,12 @@ class Transaction:
     async def acall(self, name, /, *args, **kwargs):
         """Call a tool through the transaction (async)."""
         t = self._tool(name)
+        try:
+            self._spend()
+        except BudgetExceeded:
+            self._say(f"budget used up at {name}; rolling back")
+            await self.arollback()
+            raise
         a, k, view = _prepare(t.fn, args, kwargs)
         label = self._label(name)
         if t.reversible:
@@ -1019,14 +1044,18 @@ async def _waves(tx, steps, deps, execute):
 
 
 async def arun(plan, registry=None, confirm=None, log=None, *, parallel=False, on_event=None,
-               journal=None) -> dict:
+               journal=None, max_calls=None, max_seconds=None) -> dict:
     """Execute a plan safely. Returns {step_id: result}; raises PlanFailed after rolling back.
 
     parallel=True runs independent undoable steps concurrently. on_event and journal are passed
-    to the underlying Transaction.
+    to the underlying Transaction. max_calls rejects a longer plan before anything runs; past
+    max_seconds, the run stops before the point of no return and rolls back.
     """
     steps = order(plan, registry)
-    tx = Transaction(registry, confirm, log, on_event=on_event, journal=journal)
+    if max_calls is not None and len(steps) > max_calls:
+        raise BudgetExceeded(f"plan has {len(steps)} steps, more than max_calls={max_calls}; nothing ran")
+    tx = Transaction(registry, confirm, log, on_event=on_event, journal=journal,
+                     max_calls=max_calls, max_seconds=max_seconds)
     tools, results = tx.tools, tx.results
     ids = {s["id"] for s in steps}
     deps = {s["id"]: _deps(s, ids) for s in steps}
@@ -1039,6 +1068,8 @@ async def arun(plan, registry=None, confirm=None, log=None, *, parallel=False, o
         return _prepare(tools[s["tool"]].fn, (), _resolve(s.get("args", {}), results))
 
     async def execute(s):
+        if not perm(s):
+            tx._spend()  # never after the point of no return: a commit, once started, finishes
         a, k, view = call_for(s)
         if perm(s):
             if s["id"] not in previews:  # inputs weren't known before the gate: check now
@@ -1068,6 +1099,8 @@ async def arun(plan, registry=None, confirm=None, log=None, *, parallel=False, o
                 previews[s["id"]] = await tx._check(s["id"], s["tool"], a, k, view)
             permanent.append({"id": s["id"], "tool": s["tool"], "args": view, "preview": previews.get(s["id"])})
         current = "confirm"
+        if tx._over_time():
+            raise BudgetExceeded(f"transaction ran longer than {max_seconds} seconds")
         if permanent:
             await tx._gate(permanent)
         for s in tail:
@@ -1086,9 +1119,46 @@ async def arun(plan, registry=None, confirm=None, log=None, *, parallel=False, o
 
 
 def run(plan, registry=None, confirm=None, log=None, *, parallel=False, on_event=None,
-        journal=None) -> dict:
+        journal=None, max_calls=None, max_seconds=None) -> dict:
     """Sync version of arun(). Inside an event loop, use `await arun(...)` instead."""
-    return _sync(arun(plan, registry, confirm, log, parallel=parallel, on_event=on_event, journal=journal))
+    return _sync(arun(plan, registry, confirm, log, parallel=parallel, on_event=on_event, journal=journal,
+                      max_calls=max_calls, max_seconds=max_seconds))
+
+
+async def adry_run(plan, registry=None) -> dict:
+    """What run() would do, with nothing executed: validates the plan, orders it, marks the point of
+    no return, and runs the checks (dry runs by contract) of permanent steps whose inputs are known
+    now. Raises ValueError for an invalid plan, as run() would before running anything."""
+    steps = order(plan, registry)
+    tools = TOOLS if registry is None else registry
+    ids = {s["id"] for s in steps}
+    out, ponr = [], None
+    for s in steps:
+        t, deps = tools[s["tool"]], _deps(s, ids)
+        row = {"id": s["id"], "tool": s["tool"], "permanent": not t.reversible, "after": deps}
+        if not t.reversible:
+            ponr = ponr or s["id"]
+            if not t.check:
+                row["check"] = None
+            elif deps:
+                row["check"] = {"waits_for": deps}  # checked at run time, once those steps ran
+            else:
+                a, k, view = _prepare(t.fn, (), s.get("args", {}))
+                ca, ck = _fit(t.check, a, k, view)
+                try:
+                    row["check"] = {"preview": await _attempt(t.check, ca, ck, 0, t.timeout)}
+                except Exception as e:
+                    row["check"] = {"error": f"{type(e).__name__}: {e}"}
+        out.append(row)
+    return {"steps": out, "point_of_no_return": ponr,
+            "undoable": [r["id"] for r in out if not r["permanent"]],
+            "permanent": [r["id"] for r in out if r["permanent"]],
+            "would_fail": [r["id"] for r in out if isinstance(r.get("check"), dict) and "error" in r["check"]]}
+
+
+def dry_run(plan, registry=None) -> dict:
+    """Sync version of adry_run()."""
+    return _sync(adry_run(plan, registry))
 
 
 # ---------------------------------------------------------------------------- journals
