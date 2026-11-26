@@ -90,3 +90,30 @@ def test_pydantic_ai_tool_error_rolls_back():
     with pytest.raises(ConnectionError):  # PydanticAI ends the run; the block rolls back
         asyncio.run(go())
     assert world == {"holds": [], "sent": []}  # the hold was undone, the email never sent
+
+
+def test_openai_budget_overrun_ends_the_run(monkeypatch):
+    """BudgetExceeded must not go back to the model as text: the transaction has rolled back."""
+    import importlib
+    import sys
+    import types
+
+    from rubicon import BudgetExceeded
+
+    fake = types.ModuleType("agents")
+    fake.FunctionTool = lambda **kw: types.SimpleNamespace(**kw)
+    monkeypatch.setitem(sys.modules, "agents", fake)
+    monkeypatch.delitem(sys.modules, "rubicon_openai_agents", raising=False)
+    adapter = importlib.import_module("rubicon_openai_agents")
+    world, reg = registry()
+
+    async def go():
+        tx = Transaction(reg, confirm=lambda st: True, log=lambda m: None, max_calls=1)
+        hold = {t.name: t for t in adapter.function_tools(tx)}["hold"]
+        await hold.on_invoke_tool(None, json.dumps({"flight": "AI1"}))
+        with pytest.raises(BudgetExceeded):
+            await hold.on_invoke_tool(None, json.dumps({"flight": "AI2"}))
+
+    asyncio.run(go())
+    monkeypatch.delitem(sys.modules, "rubicon_openai_agents")
+    assert world["holds"] == []  # rolled back

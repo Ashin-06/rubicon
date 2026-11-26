@@ -815,11 +815,23 @@ class Transaction:
             self._write("checkpoint", step=label, tool=name, args=_jsonable(view), result=_jsonable(value))
             saved[:] = [value]
 
+        stale, tries = [], [0]  # checkpoints of earlier tries that failed: each needs its own undo
+
+        def attempt(*args, **kwargs):
+            tries[0] += 1
+            if saved:  # the previous try checkpointed, then failed: keep its undo under its own id
+                rec = {"id": f"{label}/try{tries[0] - 1}", "tool": name, "args": view, "result": saved.pop()}
+                self._write("checkpoint", step=rec["id"], tool=name, args=_jsonable(view),
+                            result=_jsonable(rec["result"]))
+                stale.append(rec)
+            return t.fn(*args, **kwargs)
+
         token = _CHECKPOINT.set(None if permanent else record)
         try:
-            r = await _attempt(t.fn, a, k, t.retries, t.timeout)
+            r = await _attempt(attempt, a, k, t.retries, t.timeout)
         except BaseException as e:
             self._running.discard(label)
+            self.done.extend(stale)
             if saved:  # part of the step happened: roll it back like a finished step
                 self.done.append({"id": label, "tool": name, "args": view, "result": saved[0]})
             try:
@@ -830,6 +842,13 @@ class Transaction:
             raise
         finally:
             _CHECKPOINT.reset(token)
+        for rec in stale:  # the step succeeded on a later try: what the failed tries left is garbage
+            try:
+                await self._undo(rec)
+                self._write("undone", step=rec["id"])
+            except Exception as e:
+                self._write("undo_failed", step=rec["id"], error=repr(e))
+                _complain(f"could not undo {rec['id']} (a failed try of {label}): {e!r}")
         self._running.discard(label)
         ms = round((time.perf_counter() - start) * 1000, 1)
         self.results[label] = r

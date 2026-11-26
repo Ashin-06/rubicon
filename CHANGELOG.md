@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- A step with `retries` that called `checkpoint()` and then failed lost that try's undo: only
+  the last try's checkpoint was undone. Each failed try's checkpoint is now journaled under
+  `<step>/tryN` and undone, at once if a later try succeeds or on rollback if the step fails.
+- `rubicon_openai_agents` no longer hands `BudgetExceeded` back to the model as text. The
+  transaction has already rolled back, so the error now ends the run instead of letting the
+  block exit cleanly as if it had succeeded.
+
 ## 0.12.0 - 2026-11-23
 
 ### Added
