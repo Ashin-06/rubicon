@@ -126,3 +126,40 @@ def test_a_crash_mid_step_is_undone_only_with_a_checkpoint(tmp_path, with_checkp
     else:  # the old window: the order exists, but nothing says how to undo it
         assert report["uncertain"] == ["o"] and cancelled == []
     assert os.path.exists(orders)
+
+
+def test_a_failed_try_s_checkpoint_is_undone_when_a_retry_succeeds(monkeypatch, tmp_path):
+    import rubicon
+    monkeypatch.setattr(rubicon, "RETRY_DELAY", 0)
+    made, undone, reg = [], [], {}
+
+    def place():
+        made.append(f"order{len(made) + 1}")
+        checkpoint(made[-1])
+        if len(made) == 1:
+            raise ConnectionError("flaky")
+        return made[-1]
+
+    tool(place, undo=undone.append, retries=1, registry=reg)
+    journal = FileJournal(tmp_path / "j.jsonl")
+    with Transaction(reg, log=lambda m: None, journal=journal) as tx:
+        assert tx.call("place") == "order2"
+    assert undone == ["order1"]  # the orphan of the failed try; order2 is the committed result
+    assert recover(journal, registry=reg) == [] and undone == ["order1"]
+
+
+def test_failed_tries_are_all_undone_when_the_step_fails(monkeypatch):
+    import rubicon
+    monkeypatch.setattr(rubicon, "RETRY_DELAY", 0)
+    made, undone, reg = [], [], {}
+
+    def place():
+        made.append(f"order{len(made) + 1}")
+        checkpoint(made[-1])
+        raise ConnectionError("down")
+
+    tool(place, undo=undone.append, retries=2, registry=reg)
+    with pytest.raises(ConnectionError):
+        with Transaction(reg, log=lambda m: None) as tx:
+            tx.call("place")
+    assert sorted(undone) == ["order1", "order2", "order3"]
